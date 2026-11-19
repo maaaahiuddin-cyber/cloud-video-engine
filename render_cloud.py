@@ -111,8 +111,9 @@ VIDEO_FADE_DURATION = 0.35
 OUTPUT_W = 1080
 OUTPUT_H = 1920
 FPS = 30
+SCENE_BREAK_SECONDS = 120  # 2-minute break after each scene is generated
 
-# Cloudflare Workers AI models in priority order (all run on your Cloudflare account)
+# Cloudflare Workers AI models in priority order
 CF_IMAGE_MODELS = [
     "@cf/black-forest-labs/flux-1-schnell",
     "@cf/bytedance/stable-diffusion-xl-lightning",
@@ -342,7 +343,6 @@ def generate_cloudflare_scene_strict(full_prompt, seed, out_path, scene_label):
     for model_id in CF_IMAGE_MODELS:
         url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/{model_id}"
 
-        # Build model-specific payload
         if "flux-1-schnell" in model_id:
             payload_body = {
                 "prompt": full_prompt,
@@ -471,7 +471,7 @@ def add_drifting_particles_clip(still_path, clip_dur, out_mp4, seed):
 
 
 def build_cloudflare_illustrated_video(line_prompts, line_start_times, total_duration):
-    """Generates ALL scenes exclusively on Cloudflare Workers AI with intentional pacing."""
+    """Generates ALL scenes exclusively on Cloudflare Workers AI with a 2-minute break after each scene."""
     base_seed = random.randint(100000, 999999)
     num_scenes = len(line_prompts)
     scene_durations = []
@@ -490,17 +490,19 @@ def build_cloudflare_illustrated_video(line_prompts, line_start_times, total_dur
         full_prompt = f"{style_prefix}, {s_prompt}"
         seed = base_seed + (idx * 29)
 
-        # Strictly generate via Cloudflare Workers AI (raises error rather than producing blank scenes)
         generate_cloudflare_scene_strict(full_prompt, seed, still_path, scene_label)
 
         clip_mp4 = f"scene_clip_{idx}.mp4"
         add_drifting_particles_clip(still_path, s_dur + 0.4, clip_mp4, seed)
         clip_files.append(clip_mp4)
 
-        # Intentional 3.5s pacing pause between Cloudflare image requests so rate limits never trigger
+        # 2-minute (120s) break after each scene is generated
         if idx < num_scenes - 1:
-            print(f"{scene_label} Completed. Waiting 3.5s before generating next Cloudflare scene...")
-            time.sleep(3.5)
+            print(
+                f"{scene_label} Completed. Taking a {SCENE_BREAK_SECONDS // 60}-minute "
+                f"({SCENE_BREAK_SECONDS}s) break before next scene..."
+            )
+            time.sleep(SCENE_BREAK_SECONDS)
 
     if len(clip_files) == 1:
         subprocess.run(["cp", clip_files[0], "raw_video.mp4"], check=True)
@@ -808,7 +810,7 @@ def main():
     vo_duration = get_duration("voice.mp3")
     total_duration = max(14.0, round(VO_START_DELAY + vo_duration + END_CARD_SECONDS + EXTRA_TAIL_SECONDS, 2))
 
-    # Exclusively generates all 7 scenes on Cloudflare Workers AI
+    # Exclusively generates all scenes on Cloudflare Workers AI with a 2-minute break after each scene
     build_cloudflare_illustrated_video(line_prompts, line_start_times, total_duration)
 
     fetch_asmr_audio(total_duration)
