@@ -3,17 +3,19 @@ import re
 import sys
 import glob
 import json
+import time
 import math
+import base64
 import random
 import urllib.parse
 import textwrap
-import requests
 import subprocess
+import requests
 
 try:
     import soundfile as sf
     import numpy as np
-    from PIL import Image, ImageFilter
+    from PIL import Image
     from kokoro_onnx import Kokoro
 except ImportError:
     subprocess.run([
@@ -22,7 +24,7 @@ except ImportError:
     ], check=True)
     import soundfile as sf
     import numpy as np
-    from PIL import Image, ImageFilter
+    from PIL import Image
     from kokoro_onnx import Kokoro
 
 # 1. Auto-sanitize CLOUDINARY_URL BEFORE importing cloudinary
@@ -47,12 +49,20 @@ try:
 except Exception as e:
     print(f"Cloudinary URL parse warning: {e}")
 
-# 2. Load payload from Google Sheets
+# 2. Load payload from Google Sheets (10-property client_payload + branding_json)
 raw_payload = os.environ.get("PAYLOAD_JSON", "{}")
 try:
     payload = json.loads(raw_payload) if raw_payload else {}
 except Exception:
     payload = {}
+
+branding_raw = payload.get("branding_json", "{}")
+try:
+    branding = json.loads(branding_raw) if isinstance(branding_raw, str) and branding_raw else (
+        branding_raw if isinstance(branding_raw, dict) else {}
+    )
+except Exception:
+    branding = {}
 
 row_id = str(payload.get("row_id", "2")).strip()
 title = str(payload.get("title", "The Quiet Bench")).strip()
@@ -68,9 +78,9 @@ style_prefix = str(payload.get(
     "vintage gouache painting, risograph grain, 1970s travel poster palette, deep teal and burnt orange, warm lantern halation glow, wide empty center space for text, painterly brushwork, no text, no watermark"
 )).strip()
 search_keyword = str(payload.get("search_keyword", "gentle rain window piano ambient")).strip()
-fallback_keyword = str(payload.get("fallback_keyword", "rain")).strip()
-watermark_handle = str(payload.get("watermark_handle", "@wordsoftheworld")).strip()
-end_card_credit = str(payload.get("end_card_credit", "Written & Voiced by Words of the World")).strip()
+fallback_keyword = str(branding.get("fallback_keyword", payload.get("fallback_keyword", "rain"))).strip()
+watermark_handle = str(branding.get("watermark_handle", payload.get("watermark_handle", "@wordsoftheworld"))).strip()
+end_card_credit = str(branding.get("end_card_credit", payload.get("end_card_credit", "Written & Voiced by Words of the World"))).strip()
 caption = str(payload.get(
     "caption",
     "Home is a person, not a place.\n\n#poetryreels #quietlove #wordsoftheworld #reels"
@@ -87,11 +97,11 @@ if raw_webhook.startswith("MAKE_WEBHOOK_URL="):
     raw_webhook = raw_webhook.split("MAKE_WEBHOOK_URL=", 1)[1].strip().strip('"').strip("'")
 MAKE_WEBHOOK_URL = raw_webhook if raw_webhook.startswith("http") else PRIMARY_MAKE_WEBHOOK
 
-VO_START_DELAY = 0.6
-END_CARD_SECONDS = 2.5
-EXTRA_TAIL_SECONDS = 2.0
-AUDIO_FADE_DURATION = 1.50
-VIDEO_FADE_DURATION = 0.35
+VO_START_DELAY = 0.6          # Fast-hook voiceover start (600ms)
+END_CARD_SECONDS = 2.5        # Closing credit card duration
+EXTRA_TAIL_SECONDS = 2.0      # Extra calm tail after end card
+AUDIO_FADE_DURATION = 1.50    # Smooth 1.50s master audio fade-out
+VIDEO_FADE_DURATION = 0.35    # 0.35s micro-dissolve for seamless looping (+1.15s reading time)
 OUTPUT_W = 1080
 OUTPUT_H = 1920
 FPS = 30
@@ -218,7 +228,6 @@ def get_duration(filename):
 
 
 def generate_kokoro_asmr_voiceover(lines):
-    """Generates blended 55% af_nicole + 45% af_heart voiceover and returns per-line start timestamps."""
     line_start_times = []
     raw_gen = False
     try:
@@ -241,7 +250,6 @@ def generate_kokoro_asmr_voiceover(lines):
             start_sec = round(VO_START_DELAY + (cumulative_samples / float(sample_rate)), 2)
             line_start_times.append(start_sec)
 
-            # Add trailing period if missing for natural cadence
             spoken_line = line if line[-1] in ".!?," else line + "."
             samples, sample_rate = kokoro.create(spoken_line, voice=target_voice, speed=speed, lang="en-us")
             audio_segments.append(samples)
@@ -304,37 +312,73 @@ def generate_scene_image_cloudflare(full_prompt, seed, out_path):
     }
     body = {
         "prompt": full_prompt,
-        "width": 768,
-        "height": 1344,
+        "width": 576,
+        "height": 1024,
         "num_steps": 4,
         "seed": seed
     }
-    resp = requests.post(url, headers=headers, json=body, timeout=60)
-    if resp.status_code == 200:
-        content_type = resp.headers.get("Content-Type", "")
-        if "image" in content_type:
-            with open(out_path, "wb") as f:
-                f.write(resp.content)
-            return True
-        data = resp.json()
-        b64_img = data.get("result", {}).get("image")
-        if b64_img:
-            import base64
-            with open(out_path, "wb") as f:
-                f.write(base64.b64decode(b64_img))
-            return True
-    print(f"Cloudflare Workers AI warning ({resp.status_code}): {resp.text[:200]}")
+    try:
+        resp = requests.post(url, headers=headers, json=body, timeout=60)
+        if resp.status_code == 200:
+            content_type = resp.headers.get("Content-Type", "")
+            if "image" in content_type:
+                with open(out_path, "wb") as f:
+                    f.write(resp.content)
+                return True
+            data = resp.json()
+            b64_img = data.get("result", {}).get("image")
+            if b64_img:
+                with open(out_path, "wb") as f:
+                    f.write(base64.b64decode(b64_img))
+                return True
+        print(f"Cloudflare status {resp.status_code}: {resp.text[:160]}")
+    except Exception as e:
+        print(f"Cloudflare request error: {e}")
     return False
 
 
-def generate_scene_image_pollinations(full_prompt, seed, out_path):
-    encoded = urllib.parse.quote(full_prompt)
-    url = f"https://image.pollinations.ai/prompt/{encoded}?width=768&height=1344&seed={seed}&nologo=true"
-    resp = requests.get(url, timeout=45)
-    if resp.status_code == 200 and len(resp.content) > 10_000:
-        with open(out_path, "wb") as f:
-            f.write(resp.content)
-        return True
+def generate_scene_image_pollinations(short_prompt, seed, out_path):
+    encoded = urllib.parse.quote(short_prompt[:220])
+    url = f"https://image.pollinations.ai/prompt/{encoded}?width=576&height=1024&seed={seed}&nologo=true"
+    for attempt in range(2):
+        try:
+            resp = requests.get(url, timeout=45)
+            if resp.status_code == 200 and len(resp.content) > 10_000:
+                with open(out_path, "wb") as f:
+                    f.write(resp.content)
+                return True
+            if resp.status_code == 429:
+                time.sleep(5 * (attempt + 1))
+            else:
+                time.sleep(2)
+        except Exception as e:
+            print(f"Pollinations attempt {attempt + 1} error: {e}")
+            time.sleep(2)
+    return False
+
+
+def generate_scene_image_pixabay_illustration(query_text, out_path):
+    if not PIXABAY_API_KEY:
+        return False
+    try:
+        q = urllib.parse.quote(query_text[:80])
+        url = (
+            f"https://pixabay.com/api/?key={PIXABAY_API_KEY}"
+            f"&q={q}&image_type=illustration&orientation=vertical&per_page=10&safesearch=true"
+        )
+        r = requests.get(url, timeout=20)
+        hits = r.json().get("hits", []) if r.status_code == 200 else []
+        if hits:
+            chosen = random.choice(hits)
+            img_url = chosen.get("largeImageURL") or chosen.get("webformatURL")
+            if img_url:
+                img_data = requests.get(img_url, timeout=30).content
+                if len(img_data) > 10_000:
+                    with open(out_path, "wb") as f:
+                        f.write(img_data)
+                    return True
+    except Exception as e:
+        print(f"Pixabay illustration fallback error: {e}")
     return False
 
 
@@ -345,39 +389,39 @@ def is_valid_image(path):
         with Image.open(path) as im:
             w, h = im.size
             arr = np.asarray(im.convert("RGB"), dtype=np.float32)
-            mean_val = float(arr.mean())
-            return w >= 256 and h >= 256 and mean_val > 5.0
+            return w >= 256 and h >= 256 and float(arr.mean()) > 5.0
     except Exception:
         return False
 
 
 def add_drifting_particles_clip(still_path, clip_dur, out_mp4, seed):
-    """Creates a smooth Ken Burns clip with subtle drifting warm dust/firefly particles using Pillow + FFmpeg."""
     base_img = Image.open(still_path).convert("RGB").resize((OUTPUT_W, OUTPUT_H), Image.Resampling.LANCZOS)
     frames_dir = f"particles_{seed}"
     os.makedirs(frames_dir, exist_ok=True)
 
     rng = random.Random(seed)
-    num_particles = 28
     particles = [
-        {
-            "x0": rng.uniform(60, OUTPUT_W - 60),
-            "y0": rng.uniform(140, OUTPUT_H - 140),
-            "amp_x": rng.uniform(10, 26),
-            "amp_y": rng.uniform(12, 32),
-            "freq": rng.uniform(0.35, 0.75),
-            "phase": rng.uniform(0, 6.28),
-            "r": rng.uniform(2.2, 4.8)
-        }
-        for _ in range(num_particles)
+        (
+            rng.uniform(60, OUTPUT_W - 60),
+            rng.uniform(140, OUTPUT_H - 140),
+            rng.uniform(10, 24),
+            rng.uniform(12, 28),
+            rng.uniform(0.35, 0.75),
+            rng.uniform(0, 6.28),
+            rng.uniform(2.2, 4.5)
+        )
+        for _ in range(24)
     ]
 
+    grid_h, grid_w = OUTPUT_H // 8, OUTPUT_W // 8
+    yy, xx = np.mgrid[0:grid_h, 0:grid_w]
+    xx_f = xx.astype(np.float32)
+    yy_f = yy.astype(np.float32)
+
     num_frames = max(int(round(clip_dur * FPS)), 15)
-    # Sample at 15fps overlay or 30fps directly for short clips
     for f_idx in range(num_frames):
         t = f_idx / float(FPS)
         progress = f_idx / float(max(num_frames - 1, 1))
-        # Gentle eased zoom from 1.00 to 1.06
         ease = 0.5 - 0.5 * math.cos(math.pi * progress)
         zoom = 1.00 + (0.06 * ease)
         crop_w = int(OUTPUT_W / zoom)
@@ -385,23 +429,27 @@ def add_drifting_particles_clip(still_path, clip_dur, out_mp4, seed):
         left = max(0, min(OUTPUT_W - crop_w, (OUTPUT_W - crop_w) // 2))
         top = max(0, min(OUTPUT_H - crop_h, (OUTPUT_H - crop_h) // 2))
 
-        frame = base_img.crop((left, top, left + crop_w, top + crop_h)).resize((OUTPUT_W, OUTPUT_H), Image.Resampling.BILINEAR)
-        # Subtle warm glow dots using numpy mask
+        frame = base_img.crop((left, top, left + crop_w, top + crop_h)).resize(
+            (OUTPUT_W, OUTPUT_H), Image.Resampling.BILINEAR
+        )
         arr = np.asarray(frame, dtype=np.float32)
-        yy, xx = np.mgrid[0:OUTPUT_H:8, 0:OUTPUT_W:8]
-        glow_acc = np.zeros_like(yy, dtype=np.float32)
-        for p in particles:
-            px = (p["x0"] + p["amp_x"] * math.sin(2 * math.pi * p["freq"] * t + p["phase"])) / 8.0
-            py = (p["y0"] + p["amp_y"] * math.cos(2 * math.pi * p["freq"] * t + p["phase"])) / 8.0
-            dist2 = (xx - px) ** 2 + (yy - py) ** 2
-            radius2 = max((p["r"] / 4.0) ** 2, 0.8)
-            pulse = 0.65 + 0.35 * math.sin(3.0 * t + p["phase"])
-            glow_acc += pulse * np.exp(-dist2 / (2.0 * radius2))
+
+        glow_acc = np.zeros((grid_h, grid_w), dtype=np.float32)
+        for x0, y0, ax, ay, freq, phase, rad in particles:
+            px = (x0 + ax * math.sin(2 * math.pi * freq * t + phase)) / 8.0
+            py = (y0 + ay * math.cos(2 * math.pi * freq * t + phase)) / 8.0
+            dist2 = (xx_f - px) ** 2 + (yy_f - py) ** 2
+            sigma2 = max((rad / 4.0) ** 2, 0.8)
+            pulse = 0.65 + 0.35 * math.sin(3.0 * t + phase)
+            glow_acc += pulse * np.exp(-dist2 / (2.0 * sigma2))
 
         glow_full = np.asarray(
-            Image.fromarray(np.clip(glow_acc * 255, 0, 255).astype(np.uint8)).resize((OUTPUT_W, OUTPUT_H), Image.Resampling.BILINEAR),
+            Image.fromarray(np.clip(glow_acc * 255, 0, 255).astype(np.uint8)).resize(
+                (OUTPUT_W, OUTPUT_H), Image.Resampling.BILINEAR
+            ),
             dtype=np.float32
         ) / 255.0
+
         arr[:, :, 0] = np.clip(arr[:, :, 0] + glow_full * 95.0, 0, 255)
         arr[:, :, 1] = np.clip(arr[:, :, 1] + glow_full * 68.0, 0, 255)
         arr[:, :, 2] = np.clip(arr[:, :, 2] + glow_full * 24.0, 0, 255)
@@ -418,7 +466,6 @@ def add_drifting_particles_clip(still_path, clip_dur, out_mp4, seed):
 
 
 def build_illustrated_background_video(line_prompts, line_start_times, total_duration):
-    """Generates 1 painted illustration per script line and stitches them with smooth cross-dissolves."""
     base_seed = random.randint(100000, 999999)
     num_scenes = len(line_prompts)
     scene_durations = []
@@ -434,17 +481,26 @@ def build_illustrated_background_video(line_prompts, line_start_times, total_dur
     for idx, (s_prompt, s_dur) in enumerate(zip(line_prompts, scene_durations)):
         still_path = f"scene_{idx}.png"
         full_prompt = f"{style_prefix}, {s_prompt}"
+        short_prompt = f"gouache illustration, {s_prompt}, warm lighting, no text"
         ok = False
+
         for attempt in range(2):
-            seed = base_seed + idx * 10 + attempt
+            seed = base_seed + (idx * 17) + attempt
             if generate_scene_image_cloudflare(full_prompt, seed, still_path) and is_valid_image(still_path):
+                print(f"[Scene {idx + 1}/{num_scenes}] Generated via Cloudflare Workers AI -> {still_path}")
                 ok = True
                 break
-            if generate_scene_image_pollinations(full_prompt, seed, still_path) and is_valid_image(still_path):
+            if generate_scene_image_pollinations(short_prompt, seed, still_path) and is_valid_image(still_path):
+                print(f"[Scene {idx + 1}/{num_scenes}] Generated via Pollinations AI -> {still_path}")
                 ok = True
                 break
 
+        if not ok and generate_scene_image_pixabay_illustration(s_prompt, still_path) and is_valid_image(still_path):
+            print(f"[Scene {idx + 1}/{num_scenes}] Generated via Pixabay Illustration -> {still_path}")
+            ok = True
+
         if not ok:
+            print(f"[Scene {idx + 1}/{num_scenes}] All image sources failed; using dark matte fallback clip.")
             subprocess.run([
                 "ffmpeg", "-y", "-f", "lavfi",
                 "-i", f"color=c=#13222b:s={OUTPUT_W}x{OUTPUT_H}:r={FPS}:d={s_dur:.2f}",
@@ -457,11 +513,13 @@ def build_illustrated_background_video(line_prompts, line_start_times, total_dur
             add_drifting_particles_clip(still_path, s_dur + 0.4, clip_mp4, base_seed + idx)
             clip_files.append(clip_mp4)
 
+        if idx < num_scenes - 1:
+            time.sleep(2.5)
+
     if len(clip_files) == 1:
         subprocess.run(["cp", clip_files[0], "raw_video.mp4"], check=True)
         return
 
-    # Concatenate scene clips cleanly and trim/pad to total_duration
     concat_list = "scenes_concat.txt"
     with open(concat_list, "w", encoding="utf-8") as f:
         for cf in clip_files:
@@ -611,11 +669,8 @@ def render_ffmpeg(piano_file, lines, line_start_times, vo_duration, total_durati
     title_font = get_title_font()
     body_font = get_body_font()
 
-    # Write Title file
     with open("title_txt.txt", "w", encoding="utf-8", newline="\n") as f:
         f.write(title)
-
-    # Write Watermark & End Card files
     with open("watermark_txt.txt", "w", encoding="utf-8", newline="\n") as f:
         f.write(watermark_handle)
 
@@ -628,7 +683,6 @@ def render_ffmpeg(piano_file, lines, line_start_times, vo_duration, total_durati
     video_fade_start = max(total_duration - VIDEO_FADE_DURATION, 1.0)
 
     filters = []
-    # Title visible from Frame 0 until end_card_start
     filters.append(
         f"drawtext=fontfile={title_font}:textfile=title_txt.txt:"
         f"fontcolor=#FFD700:fontsize=56:x=76:y=360:"
@@ -636,7 +690,6 @@ def render_ffmpeg(piano_file, lines, line_start_times, vo_duration, total_durati
         f"enable='lt(t,{end_card_start:.2f})'"
     )
 
-    # One line of poem at a time synced to its Kokoro timestamp
     for idx, line in enumerate(lines):
         wrapped_line = "\n".join(textwrap.wrap(line, width=28)) or line
         l_file = f"line_{idx}.txt"
@@ -654,7 +707,6 @@ def render_ffmpeg(piano_file, lines, line_start_times, vo_duration, total_durati
             f"enable='between(t,{l_start:.2f},{l_end:.2f})'"
         )
 
-    # Subtle watermark below body text
     if watermark_handle:
         filters.append(
             f"drawtext=fontfile={body_font}:textfile=watermark_txt.txt:"
@@ -663,7 +715,6 @@ def render_ffmpeg(piano_file, lines, line_start_times, vo_duration, total_durati
             f"enable='between(t,0.60,{end_card_start:.2f})'"
         )
 
-    # End Card Credit on final ~2.5s
     if end_card_credit:
         filters.append(
             f"drawbox=x=0:y=0:w=iw:h=ih:color=black@0.68:t=fill:enable='gte(t,{end_card_start:.2f})',"
