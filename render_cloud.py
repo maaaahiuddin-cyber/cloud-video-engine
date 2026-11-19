@@ -1,3 +1,38 @@
+# 2. Load payload from Google Sheets (10-property client_payload + branding_json)
+raw_payload = os.environ.get("PAYLOAD_JSON", "{}")
+try:
+    payload = json.loads(raw_payload) if raw_payload else {}
+except Exception:
+    payload = {}
+
+branding_raw = payload.get("branding_json", "{}")
+try:
+    branding = json.loads(branding_raw) if isinstance(branding_raw, str) and branding_raw else (branding_raw if isinstance(branding_raw, dict) else {})
+except Exception:
+    branding = {}
+
+row_id = str(payload.get("row_id", "2")).strip()
+title = str(payload.get("title", "The Quiet Bench")).strip()
+niche = str(payload.get("niche", "love")).strip()
+visual_mode = str(payload.get("visual_mode", "illustration")).strip().lower()
+overlay_text = str(payload.get(
+    "overlay_text",
+    "We sat beneath the old oak tree\nTwo quiet souls in autumn rain\nNo heavy words were left to say\nJust shared umbrellas in the dark\nYour shoulder brushed against my coat\nAnd suddenly the cold was gone\nHome is a person, not a place"
+)).strip()
+line_visual_prompts_raw = str(payload.get("line_visual_prompts", "")).strip()
+style_prefix = str(payload.get(
+    "style_prefix",
+    "vintage gouache painting, risograph grain, 1970s travel poster palette, deep teal and burnt orange, warm lantern halation glow, wide empty center space for text, painterly brushwork, no text, no watermark"
+)).strip()
+search_keyword = str(payload.get("search_keyword", "gentle rain window piano ambient")).strip()
+fallback_keyword = str(branding.get("fallback_keyword", payload.get("fallback_keyword", "rain"))).strip()
+watermark_handle = str(branding.get("watermark_handle", payload.get("watermark_handle", "@wordsoftheworld"))).strip()
+end_card_credit = str(branding.get("end_card_credit", payload.get("end_card_credit", "Written & Voiced by Words of the World"))).strip()
+caption = str(payload.get(
+    "caption",
+    "Home is a person, not a place.\n\n#poetryreels #quietlove #wordsoftheworld #reels"
+)).strip()
+
 import os
 import re
 import sys
