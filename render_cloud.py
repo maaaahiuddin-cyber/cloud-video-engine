@@ -3,14 +3,14 @@ import re
 import sys
 import glob
 import json
-import time
 import math
+import time
 import base64
 import random
 import urllib.parse
 import textwrap
-import subprocess
 import requests
+import subprocess
 
 try:
     import soundfile as sf
@@ -58,9 +58,7 @@ except Exception:
 
 branding_raw = payload.get("branding_json", "{}")
 try:
-    branding = json.loads(branding_raw) if isinstance(branding_raw, str) and branding_raw else (
-        branding_raw if isinstance(branding_raw, dict) else {}
-    )
+    branding = json.loads(branding_raw) if isinstance(branding_raw, str) and branding_raw else (branding_raw if isinstance(branding_raw, dict) else {})
 except Exception:
     branding = {}
 
@@ -86,9 +84,17 @@ caption = str(payload.get(
     "Home is a person, not a place.\n\n#poetryreels #quietlove #wordsoftheworld #reels"
 )).strip()
 
+# Sanitize Cloudflare credentials
 CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID", "").strip().strip('"').strip("'")
+if CF_ACCOUNT_ID.startswith("CF_ACCOUNT_ID="):
+    CF_ACCOUNT_ID = CF_ACCOUNT_ID.split("CF_ACCOUNT_ID=", 1)[1].strip().strip('"').strip("'")
+
 CF_API_TOKEN = os.environ.get("CF_API_TOKEN", "").strip().strip('"').strip("'")
-PIXABAY_API_KEY = os.environ.get("PIXABAY_API_KEY", "").strip().strip('"').strip("'")
+if CF_API_TOKEN.startswith("CF_API_TOKEN="):
+    CF_API_TOKEN = CF_API_TOKEN.split("CF_API_TOKEN=", 1)[1].strip().strip('"').strip("'")
+if CF_API_TOKEN.lower().startswith("bearer "):
+    CF_API_TOKEN = CF_API_TOKEN[7:].strip()
+
 FREESOUND_API_KEY = os.environ.get("FREESOUND_API_KEY", "").strip().strip('"').strip("'")
 
 PRIMARY_MAKE_WEBHOOK = "https://hook.us2.make.com/ga5opcigaf8fw3keq4zh5x5uy2r6gs24"
@@ -97,22 +103,21 @@ if raw_webhook.startswith("MAKE_WEBHOOK_URL="):
     raw_webhook = raw_webhook.split("MAKE_WEBHOOK_URL=", 1)[1].strip().strip('"').strip("'")
 MAKE_WEBHOOK_URL = raw_webhook if raw_webhook.startswith("http") else PRIMARY_MAKE_WEBHOOK
 
-VO_START_DELAY = 0.6          # Fast-hook voiceover start (600ms)
-END_CARD_SECONDS = 2.5        # Closing credit card duration
-EXTRA_TAIL_SECONDS = 2.0      # Extra calm tail after end card
-AUDIO_FADE_DURATION = 1.50    # Smooth 1.50s master audio fade-out
-VIDEO_FADE_DURATION = 0.35    # 0.35s micro-dissolve for seamless looping (+1.15s reading time)
+VO_START_DELAY = 0.6
+END_CARD_SECONDS = 2.5
+EXTRA_TAIL_SECONDS = 2.0
+AUDIO_FADE_DURATION = 1.50
+VIDEO_FADE_DURATION = 0.35
 OUTPUT_W = 1080
 OUTPUT_H = 1920
 FPS = 30
 
-BANNED_VISUAL_TAGS = {
-    "animation", "animated", "cartoon", "anime", "3d", "cgi", "render",
-    "illustration", "drawing", "sketch", "painting", "art", "abstract",
-    "fractal", "vj", "neon", "cyberpunk", "sci-fi", "fantasy", "ai",
-    "generated", "digital", "graphic", "motion graphics", "particles",
-    "matrix", "tunnel", "kaleidoscope", "geometry", "game", "virtual"
-}
+# Cloudflare Workers AI models in priority order (all run on your Cloudflare account)
+CF_IMAGE_MODELS = [
+    "@cf/black-forest-labs/flux-1-schnell",
+    "@cf/bytedance/stable-diffusion-xl-lightning",
+    "@cf/stabilityai/stable-diffusion-xl-base-1.0"
+]
 
 NICHE_AUDIO_MAP = {
     "rain": "gentle rain falling window ambient asmr",
@@ -228,6 +233,7 @@ def get_duration(filename):
 
 
 def generate_kokoro_asmr_voiceover(lines):
+    """Generates blended 55% af_nicole + 45% af_heart voiceover and returns per-line start timestamps."""
     line_start_times = []
     raw_gen = False
     try:
@@ -302,121 +308,125 @@ def generate_kokoro_asmr_voiceover(lines):
     return line_start_times
 
 
-def generate_scene_image_cloudflare(full_prompt, seed, out_path):
-    if not CF_ACCOUNT_ID or not CF_API_TOKEN:
-        return False
-    url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/@cf/black-forest-labs/flux-1-schnell"
-    headers = {
-        "Authorization": f"Bearer {CF_API_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    body = {
-        "prompt": full_prompt,
-        "width": 576,
-        "height": 1024,
-        "num_steps": 4,
-        "seed": seed
-    }
-    try:
-        resp = requests.post(url, headers=headers, json=body, timeout=60)
-        if resp.status_code == 200:
-            content_type = resp.headers.get("Content-Type", "")
-            if "image" in content_type:
-                with open(out_path, "wb") as f:
-                    f.write(resp.content)
-                return True
-            data = resp.json()
-            b64_img = data.get("result", {}).get("image")
-            if b64_img:
-                with open(out_path, "wb") as f:
-                    f.write(base64.b64decode(b64_img))
-                return True
-        print(f"Cloudflare status {resp.status_code}: {resp.text[:160]}")
-    except Exception as e:
-        print(f"Cloudflare request error: {e}")
-    return False
-
-
-def generate_scene_image_pollinations(short_prompt, seed, out_path):
-    encoded = urllib.parse.quote(short_prompt[:220])
-    url = f"https://image.pollinations.ai/prompt/{encoded}?width=576&height=1024&seed={seed}&nologo=true"
-    for attempt in range(2):
-        try:
-            resp = requests.get(url, timeout=45)
-            if resp.status_code == 200 and len(resp.content) > 10_000:
-                with open(out_path, "wb") as f:
-                    f.write(resp.content)
-                return True
-            if resp.status_code == 429:
-                time.sleep(5 * (attempt + 1))
-            else:
-                time.sleep(2)
-        except Exception as e:
-            print(f"Pollinations attempt {attempt + 1} error: {e}")
-            time.sleep(2)
-    return False
-
-
-def generate_scene_image_pixabay_illustration(query_text, out_path):
-    if not PIXABAY_API_KEY:
-        return False
-    try:
-        q = urllib.parse.quote(query_text[:80])
-        url = (
-            f"https://pixabay.com/api/?key={PIXABAY_API_KEY}"
-            f"&q={q}&image_type=illustration&orientation=vertical&per_page=10&safesearch=true"
-        )
-        r = requests.get(url, timeout=20)
-        hits = r.json().get("hits", []) if r.status_code == 200 else []
-        if hits:
-            chosen = random.choice(hits)
-            img_url = chosen.get("largeImageURL") or chosen.get("webformatURL")
-            if img_url:
-                img_data = requests.get(img_url, timeout=30).content
-                if len(img_data) > 10_000:
-                    with open(out_path, "wb") as f:
-                        f.write(img_data)
-                    return True
-    except Exception as e:
-        print(f"Pixabay illustration fallback error: {e}")
-    return False
-
-
 def is_valid_image(path):
     try:
+        if not os.path.exists(path) or os.path.getsize(path) < 5_000:
+            return False
         with Image.open(path) as im:
             im.verify()
         with Image.open(path) as im:
             w, h = im.size
             arr = np.asarray(im.convert("RGB"), dtype=np.float32)
-            return w >= 256 and h >= 256 and float(arr.mean()) > 5.0
+            mean_val = float(arr.mean())
+            return w >= 256 and h >= 256 and mean_val > 5.0
     except Exception:
         return False
 
 
+def generate_cloudflare_scene_strict(full_prompt, seed, out_path, scene_label):
+    """
+    Uses ONLY Cloudflare Workers AI with multi-attempt backoff and multi-model fallback
+    inside Cloudflare so every single scene succeeds without failing.
+    """
+    if not CF_ACCOUNT_ID or not CF_API_TOKEN:
+        raise RuntimeError(
+            "CF_ACCOUNT_ID or CF_API_TOKEN is missing in GitHub Secrets! "
+            "Add both secrets in Settings -> Secrets and variables -> Actions."
+        )
+
+    headers = {
+        "Authorization": f"Bearer {CF_API_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+    for model_id in CF_IMAGE_MODELS:
+        url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/{model_id}"
+
+        # Build model-specific payload
+        if "flux-1-schnell" in model_id:
+            payload_body = {
+                "prompt": full_prompt,
+                "width": 576,
+                "height": 1024,
+                "num_steps": 4,
+                "seed": seed
+            }
+        else:
+            payload_body = {
+                "prompt": full_prompt,
+                "width": 576,
+                "height": 1024,
+                "num_steps": 20,
+                "seed": seed
+            }
+
+        for attempt in range(1, 5):
+            try:
+                print(f"{scene_label} Requesting {model_id} (attempt {attempt}/4)...")
+                resp = requests.post(url, headers=headers, json=payload_body, timeout=90)
+
+                if resp.status_code == 200:
+                    content_type = resp.headers.get("Content-Type", "").lower()
+                    if "image/" in content_type or "application/octet-stream" in content_type:
+                        with open(out_path, "wb") as f:
+                            f.write(resp.content)
+                    else:
+                        data = resp.json()
+                        result_obj = data.get("result", {})
+                        b64_img = result_obj.get("image") if isinstance(result_obj, dict) else None
+                        if b64_img:
+                            with open(out_path, "wb") as f:
+                                f.write(base64.b64decode(b64_img))
+
+                    if is_valid_image(out_path):
+                        print(f"{scene_label} SUCCESS via {model_id} -> {out_path}")
+                        return True
+                    else:
+                        print(f"{scene_label} Invalid image bytes returned from {model_id}, retrying...")
+
+                elif resp.status_code in (401, 403):
+                    raise RuntimeError(
+                        f"Cloudflare Authentication Error ({resp.status_code}): Check CF_ACCOUNT_ID and CF_API_TOKEN permissions. "
+                        f"Response: {resp.text[:250]}"
+                    )
+                else:
+                    wait_sec = min(30, 4 * (2 ** (attempt - 1)))
+                    print(
+                        f"{scene_label} Cloudflare HTTP {resp.status_code} on {model_id}: {resp.text[:200]} "
+                        f"-> Waiting {wait_sec}s before retry..."
+                    )
+                    time.sleep(wait_sec)
+
+            except RuntimeError:
+                raise
+            except Exception as e:
+                wait_sec = min(25, 4 * attempt)
+                print(f"{scene_label} Network/timeout warning on {model_id}: {e} -> Waiting {wait_sec}s...")
+                time.sleep(wait_sec)
+
+    raise RuntimeError(f"{scene_label} Failed to generate image on Cloudflare Workers AI after all retries and models.")
+
+
 def add_drifting_particles_clip(still_path, clip_dur, out_mp4, seed):
+    """Creates a smooth Ken Burns clip with subtle drifting warm dust/firefly particles using Pillow + FFmpeg."""
     base_img = Image.open(still_path).convert("RGB").resize((OUTPUT_W, OUTPUT_H), Image.Resampling.LANCZOS)
     frames_dir = f"particles_{seed}"
     os.makedirs(frames_dir, exist_ok=True)
 
     rng = random.Random(seed)
+    num_particles = 26
     particles = [
-        (
-            rng.uniform(60, OUTPUT_W - 60),
-            rng.uniform(140, OUTPUT_H - 140),
-            rng.uniform(10, 24),
-            rng.uniform(12, 28),
-            rng.uniform(0.35, 0.75),
-            rng.uniform(0, 6.28),
-            rng.uniform(2.2, 4.5)
-        )
-        for _ in range(24)
+        {
+            "x0": rng.uniform(60, OUTPUT_W - 60),
+            "y0": rng.uniform(140, OUTPUT_H - 140),
+            "amp_x": rng.uniform(10, 24),
+            "amp_y": rng.uniform(12, 28),
+            "freq": rng.uniform(0.35, 0.75),
+            "phase": rng.uniform(0, 6.28),
+            "r": rng.uniform(2.2, 4.5)
+        }
+        for _ in range(num_particles)
     ]
-
-    grid_h, grid_w = OUTPUT_H // 8, OUTPUT_W // 8
-    yy, xx = np.mgrid[0:grid_h, 0:grid_w]
-    xx_f = xx.astype(np.float32)
-    yy_f = yy.astype(np.float32)
 
     num_frames = max(int(round(clip_dur * FPS)), 15)
     for f_idx in range(num_frames):
@@ -429,27 +439,22 @@ def add_drifting_particles_clip(still_path, clip_dur, out_mp4, seed):
         left = max(0, min(OUTPUT_W - crop_w, (OUTPUT_W - crop_w) // 2))
         top = max(0, min(OUTPUT_H - crop_h, (OUTPUT_H - crop_h) // 2))
 
-        frame = base_img.crop((left, top, left + crop_w, top + crop_h)).resize(
-            (OUTPUT_W, OUTPUT_H), Image.Resampling.BILINEAR
-        )
+        frame = base_img.crop((left, top, left + crop_w, top + crop_h)).resize((OUTPUT_W, OUTPUT_H), Image.Resampling.BILINEAR)
         arr = np.asarray(frame, dtype=np.float32)
-
-        glow_acc = np.zeros((grid_h, grid_w), dtype=np.float32)
-        for x0, y0, ax, ay, freq, phase, rad in particles:
-            px = (x0 + ax * math.sin(2 * math.pi * freq * t + phase)) / 8.0
-            py = (y0 + ay * math.cos(2 * math.pi * freq * t + phase)) / 8.0
-            dist2 = (xx_f - px) ** 2 + (yy_f - py) ** 2
-            sigma2 = max((rad / 4.0) ** 2, 0.8)
-            pulse = 0.65 + 0.35 * math.sin(3.0 * t + phase)
-            glow_acc += pulse * np.exp(-dist2 / (2.0 * sigma2))
+        yy, xx = np.mgrid[0:OUTPUT_H:8, 0:OUTPUT_W:8]
+        glow_acc = np.zeros_like(yy, dtype=np.float32)
+        for p in particles:
+            px = (p["x0"] + p["amp_x"] * math.sin(2 * math.pi * p["freq"] * t + p["phase"])) / 8.0
+            py = (p["y0"] + p["amp_y"] * math.cos(2 * math.pi * p["freq"] * t + p["phase"])) / 8.0
+            dist2 = (xx - px) ** 2 + (yy - py) ** 2
+            radius2 = max((p["r"] / 4.0) ** 2, 0.8)
+            pulse = 0.65 + 0.35 * math.sin(3.0 * t + p["phase"])
+            glow_acc += pulse * np.exp(-dist2 / (2.0 * radius2))
 
         glow_full = np.asarray(
-            Image.fromarray(np.clip(glow_acc * 255, 0, 255).astype(np.uint8)).resize(
-                (OUTPUT_W, OUTPUT_H), Image.Resampling.BILINEAR
-            ),
+            Image.fromarray(np.clip(glow_acc * 255, 0, 255).astype(np.uint8)).resize((OUTPUT_W, OUTPUT_H), Image.Resampling.BILINEAR),
             dtype=np.float32
         ) / 255.0
-
         arr[:, :, 0] = np.clip(arr[:, :, 0] + glow_full * 95.0, 0, 255)
         arr[:, :, 1] = np.clip(arr[:, :, 1] + glow_full * 68.0, 0, 255)
         arr[:, :, 2] = np.clip(arr[:, :, 2] + glow_full * 24.0, 0, 255)
@@ -465,7 +470,8 @@ def add_drifting_particles_clip(still_path, clip_dur, out_mp4, seed):
     ], check=True)
 
 
-def build_illustrated_background_video(line_prompts, line_start_times, total_duration):
+def build_cloudflare_illustrated_video(line_prompts, line_start_times, total_duration):
+    """Generates ALL scenes exclusively on Cloudflare Workers AI with intentional pacing."""
     base_seed = random.randint(100000, 999999)
     num_scenes = len(line_prompts)
     scene_durations = []
@@ -479,42 +485,22 @@ def build_illustrated_background_video(line_prompts, line_start_times, total_dur
 
     clip_files = []
     for idx, (s_prompt, s_dur) in enumerate(zip(line_prompts, scene_durations)):
+        scene_label = f"[Scene {idx + 1}/{num_scenes}]"
         still_path = f"scene_{idx}.png"
         full_prompt = f"{style_prefix}, {s_prompt}"
-        short_prompt = f"gouache illustration, {s_prompt}, warm lighting, no text"
-        ok = False
+        seed = base_seed + (idx * 29)
 
-        for attempt in range(2):
-            seed = base_seed + (idx * 17) + attempt
-            if generate_scene_image_cloudflare(full_prompt, seed, still_path) and is_valid_image(still_path):
-                print(f"[Scene {idx + 1}/{num_scenes}] Generated via Cloudflare Workers AI -> {still_path}")
-                ok = True
-                break
-            if generate_scene_image_pollinations(short_prompt, seed, still_path) and is_valid_image(still_path):
-                print(f"[Scene {idx + 1}/{num_scenes}] Generated via Pollinations AI -> {still_path}")
-                ok = True
-                break
+        # Strictly generate via Cloudflare Workers AI (raises error rather than producing blank scenes)
+        generate_cloudflare_scene_strict(full_prompt, seed, still_path, scene_label)
 
-        if not ok and generate_scene_image_pixabay_illustration(s_prompt, still_path) and is_valid_image(still_path):
-            print(f"[Scene {idx + 1}/{num_scenes}] Generated via Pixabay Illustration -> {still_path}")
-            ok = True
+        clip_mp4 = f"scene_clip_{idx}.mp4"
+        add_drifting_particles_clip(still_path, s_dur + 0.4, clip_mp4, seed)
+        clip_files.append(clip_mp4)
 
-        if not ok:
-            print(f"[Scene {idx + 1}/{num_scenes}] All image sources failed; using dark matte fallback clip.")
-            subprocess.run([
-                "ffmpeg", "-y", "-f", "lavfi",
-                "-i", f"color=c=#13222b:s={OUTPUT_W}x{OUTPUT_H}:r={FPS}:d={s_dur:.2f}",
-                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
-                f"scene_clip_{idx}.mp4"
-            ], check=True)
-            clip_files.append(f"scene_clip_{idx}.mp4")
-        else:
-            clip_mp4 = f"scene_clip_{idx}.mp4"
-            add_drifting_particles_clip(still_path, s_dur + 0.4, clip_mp4, base_seed + idx)
-            clip_files.append(clip_mp4)
-
+        # Intentional 3.5s pacing pause between Cloudflare image requests so rate limits never trigger
         if idx < num_scenes - 1:
-            time.sleep(2.5)
+            print(f"{scene_label} Completed. Waiting 3.5s before generating next Cloudflare scene...")
+            time.sleep(3.5)
 
     if len(clip_files) == 1:
         subprocess.run(["cp", clip_files[0], "raw_video.mp4"], check=True)
@@ -529,57 +515,6 @@ def build_illustrated_background_video(line_prompts, line_start_times, total_dur
         "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_list,
         "-t", f"{total_duration:.2f}",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p",
-        "raw_video.mp4"
-    ], check=True)
-
-
-def is_real_camera_footage(hit):
-    hit_type = str(hit.get("type", "")).lower()
-    if "animation" in hit_type or "illustration" in hit_type:
-        return False
-    tags_str = str(hit.get("tags", "")).lower()
-    tag_tokens = {t.strip() for t in tags_str.split(",") if t.strip()}
-    for banned in BANNED_VISUAL_TAGS:
-        if banned in tag_tokens or re.search(rf'\b{re.escape(banned)}\b', tags_str):
-            return False
-    return True
-
-
-def download_real_footage_background(target_duration):
-    if PIXABAY_API_KEY:
-        queries = [
-            urllib.parse.quote(search_keyword),
-            urllib.parse.quote(fallback_keyword),
-            "calm+nature+rain",
-            "ocean+waves+beach",
-            "forest+trees+wind"
-        ]
-        for orientation_param in ["&orientation=vertical", ""]:
-            for q in queries:
-                if not q:
-                    continue
-                url = (
-                    f"https://pixabay.com/api/videos/?key={PIXABAY_API_KEY}"
-                    f"&q={q}&video_type=film{orientation_param}&per_page=20&safesearch=true"
-                )
-                r = requests.get(url, timeout=20)
-                raw_hits = r.json().get("hits", []) if r.status_code == 200 else []
-                real_hits = [h for h in raw_hits if is_real_camera_footage(h)]
-                if real_hits:
-                    chosen = random.choice(real_hits)
-                    vids = chosen.get("videos", {})
-                    v_url = vids.get("large", {}).get("url") or vids.get("medium", {}).get("url") or vids.get("small", {}).get("url")
-                    if v_url:
-                        vid_data = requests.get(v_url, timeout=60).content
-                        if len(vid_data) > 50_000:
-                            with open("raw_video.mp4", "wb") as f:
-                                f.write(vid_data)
-                            return
-
-    subprocess.run([
-        "ffmpeg", "-y", "-f", "lavfi",
-        "-i", f"color=c=#0d1b2a:s={OUTPUT_W}x{OUTPUT_H}:r={FPS}:d={target_duration:.2f}",
-        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
         "raw_video.mp4"
     ], check=True)
 
@@ -671,6 +606,7 @@ def render_ffmpeg(piano_file, lines, line_start_times, vo_duration, total_durati
 
     with open("title_txt.txt", "w", encoding="utf-8", newline="\n") as f:
         f.write(title)
+
     with open("watermark_txt.txt", "w", encoding="utf-8", newline="\n") as f:
         f.write(watermark_handle)
 
@@ -872,10 +808,8 @@ def main():
     vo_duration = get_duration("voice.mp3")
     total_duration = max(14.0, round(VO_START_DELAY + vo_duration + END_CARD_SECONDS + EXTRA_TAIL_SECONDS, 2))
 
-    if visual_mode == "footage":
-        download_real_footage_background(total_duration)
-    else:
-        build_illustrated_background_video(line_prompts, line_start_times, total_duration)
+    # Exclusively generates all 7 scenes on Cloudflare Workers AI
+    build_cloudflare_illustrated_video(line_prompts, line_start_times, total_duration)
 
     fetch_asmr_audio(total_duration)
     piano_file = fetch_relaxing_piano(total_duration)
