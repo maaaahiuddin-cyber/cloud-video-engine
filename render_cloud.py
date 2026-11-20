@@ -18,7 +18,7 @@ try:
 except ImportError:
     subprocess.run([
         sys.executable, "-m", "pip", "install",
-        "kokoro-onnx", "soundfile", "numpy", "fonttools", "edge-tts", "gTTS"
+        "kokoro-onnx", "soundfile", "numpy", "edge-tts", "gTTS"
     ], check=True)
     import soundfile as sf
     import numpy as np
@@ -55,14 +55,6 @@ except Exception:
 
 BEARDED_DRAGON_SCRIPTS = [
     (
-        "Warm heat lamp glowing bright\n"
-        "Tiny dragon basking in the light\n"
-        "One slow blink and a judging side-eye\n"
-        "Living the royal reptile life\n"
-        "No rent, no rush, just warm rocks\n"
-        "My scaly little best friend"
-    ),
-    (
         "Back leg stretched out so neat\n"
         "Resting on warm sunny feet\n"
         "Zero worries in the whole wide room\n"
@@ -71,28 +63,20 @@ BEARDED_DRAGON_SCRIPTS = [
         "Stealing hearts in every place"
     ),
     (
-        "Chin resting right against the glass\n"
-        "Watching clouds and shadows pass\n"
-        "Curious eyes on every breeze\n"
-        "Calm and quiet at their ease\n"
-        "Small claws holding onto my sleeve\n"
-        "The sweetest peace I ever receive"
-    ),
-    (
-        "Lights dim low as evening falls\n"
-        "Soft shadows dance across the walls\n"
-        "Curled up snug in a cozy spot\n"
-        "The gentlest little soul I've got\n"
-        "Drift into a peaceful dream\n"
-        "Brighter than a golden beam"
+        "Warm heat lamp glowing bright\n"
+        "Tiny dragon basking in the light\n"
+        "One slow blink and a judging side-eye\n"
+        "Living the royal reptile life\n"
+        "No rent, no rush, just warm rocks\n"
+        "My scaly little best friend"
     ),
     (
         "Slow head tilt when I walk by\n"
         "Deep dark eyes that never lie\n"
-        "Patiently waiting for hornworm treats\n"
-        "The cutest ruler on four feet\n"
-        "Every little scale brings joy\n"
-        "My calm and cozy pride and joy"
+        "Listening closely to every sound\n"
+        "The sweetest companion I ever found\n"
+        "Curious heart in a spiky coat\n"
+        "Taking in every word I spoke"
     ),
     (
         "Sunbeam warming up the floor\n"
@@ -102,35 +86,29 @@ BEARDED_DRAGON_SCRIPTS = [
         "Gentle company, soft and slow\n"
         "The sweetest calm I'll ever know"
     ),
+    (
+        "Lights dim low as evening falls\n"
+        "Soft shadows dance across the walls\n"
+        "Curled up snug in a cozy spot\n"
+        "The gentlest little soul I've got\n"
+        "Drift into a peaceful dream\n"
+        "Brighter than a golden beam"
+    ),
 ]
-
-
-def resolve_bearded_dragon_overlay(raw_overlay, row_id_str, niche_str):
-    cleaned = (raw_overlay or "").strip()
-    niche_l = (niche_str or "").lower()
-    is_generic_non_dragon = any(
-        k in cleaned.lower()
-        for k in [
-            "there's a word in", "old oak tree", "last train leaves",
-            "wrote your name on folded", "walk barefoot where the tide",
-            "forest path grew dark", "no alarms and nowhere left"
-        ]
-    )
-    if not cleaned or ("bearded" not in niche_l and is_generic_non_dragon):
-        try:
-            idx = (max(1, int(row_id_str)) - 1) % len(BEARDED_DRAGON_SCRIPTS)
-        except Exception:
-            idx = 0
-        return BEARDED_DRAGON_SCRIPTS[idx]
-    return cleaned
-
 
 row_id = str(payload.get("row_id", "1")).strip()
 niche = str(payload.get("niche", "bearded dragon")).strip() or "bearded dragon"
 raw_overlay_input = str(payload.get("overlay_text", "")).strip()
-overlay_text = resolve_bearded_dragon_overlay(raw_overlay_input, row_id, niche)
-search_keyword = str(payload.get("search_keyword", "bearded dragon reptile")).strip() or "bearded dragon"
-fallback_keyword = str(payload.get("fallback_keyword", "lizard reptile")).strip() or "reptile"
+if raw_overlay_input:
+    overlay_text = raw_overlay_input
+else:
+    try:
+        overlay_text = BEARDED_DRAGON_SCRIPTS[(max(1, int(row_id)) - 1) % len(BEARDED_DRAGON_SCRIPTS)]
+    except Exception:
+        overlay_text = BEARDED_DRAGON_SCRIPTS[0]
+
+search_keyword = str(payload.get("search_keyword", "bearded dragon")).strip() or "bearded dragon"
+fallback_keyword = str(payload.get("fallback_keyword", "reptile")).strip() or "reptile"
 drive_video_url = str(payload.get("drive_video_url", "")).strip()
 caption = str(payload.get(
     "caption",
@@ -157,26 +135,6 @@ BANNED_VISUAL_TAGS = {
     "fractal", "vj", "neon", "cyberpunk", "sci-fi", "fantasy", "ai",
     "generated", "digital", "graphic", "motion graphics", "particles",
     "matrix", "tunnel", "kaleidoscope", "geometry", "game", "virtual"
-}
-
-SMOOTH_SPOKEN_MAP = {
-    "Dépaysement": "daypaizmahn",
-    "Retrouvailles": "ruhtroovigh",
-    "Sillage": "seeyahzh",
-    "Sobremesa": "sohbreh mehsah",
-    "Duende": "dwenday",
-    "Querencia": "kehrenseeah",
-    "Dolce far niente": "dohlchay far nyentay",
-    "Sprezzatura": "spretsahtoorah",
-    "木漏れ日": "komorebi",
-    "一期一会": "icheego icheeay",
-    "侘び寂び": "wahbee sahbee",
-    "Saudade": "sowdahjee",
-    "Cafuné": "kahfooneh",
-    "Desabafar": "dehzahbahfar",
-    "इंतज़ार": "intehzaar",
-    "बिछोह": "beechoh",
-    "सुकून": "sookoon",
 }
 
 
@@ -234,8 +192,8 @@ def get_quote_font_path():
 
 def prepare_overlay_lines(body_text, sentence_start_times=None):
     """
-    Prepares ONLY the overlay text lines (no title, no watermark, no end text)
-    arranged cleanly for center-bottom placement.
+    Prepares ONLY the English overlay text lines (no title, no watermark, no end text)
+    for center-bottom placement.
     """
     cleaned = (body_text or "").replace("\r\n", "\n").replace("\u2028", "\n").replace("\u2029", "\n").strip()
     if not cleaned:
@@ -288,20 +246,13 @@ def get_duration(filename):
         return 10.0
 
 
-def prepare_spoken_script(overlay_str):
-    spoken = overlay_str.replace("…", ", ").replace("...", ", ")
-    for word, phonetic in sorted(SMOOTH_SPOKEN_MAP.items(), key=lambda x: len(x[0]), reverse=True):
-        if word in spoken:
-            spoken = spoken.replace(word, phonetic)
-    return re.sub(r'\s{2,}', ' ', spoken).strip()
-
-
 def generate_kokoro_asmr_voiceover(text):
-    spoken_text = prepare_spoken_script(text)
-    chunks = re.split(r'(?<=[.!?])\s+|\n+', spoken_text.replace("\r", ""))
+    """Generates pure English Kokoro-82M voiceover directly from Overlay_Text."""
+    clean_spoken = re.sub(r'\s{2,}', ' ', (text or "").replace("…", ", ").replace("...", ", ")).strip()
+    chunks = re.split(r'(?<=[.!?])\s+|\n+', clean_spoken.replace("\r", ""))
     phrases = [c.strip() for c in chunks if c.strip()]
     if not phrases:
-        phrases = ["Warm heat lamp glowing bright."]
+        phrases = ["Back leg stretched out so neat."]
 
     sentence_start_times = []
     raw_gen = False
@@ -352,7 +303,7 @@ def generate_kokoro_asmr_voiceover(text):
         try:
             import edge_tts
             import asyncio
-            communicate = edge_tts.Communicate(spoken_text, voice="en-GB-RyanNeural", rate="-10%", pitch="-2Hz")
+            communicate = edge_tts.Communicate(clean_spoken, voice="en-GB-RyanNeural", rate="-10%", pitch="-2Hz")
             asyncio.run(communicate.save("voice_raw.wav"))
             raw_gen = True
         except Exception as e2:
@@ -396,7 +347,7 @@ def generate_kokoro_asmr_voiceover(text):
 
 
 def strip_original_audio(input_path, output_path="raw_video.mp4"):
-    """Removes 100% of the original sound (-an) from the video."""
+    """Removes 100% of the original sound (-an) from the background video."""
     try:
         subprocess.run([
             "ffmpeg", "-y", "-i", input_path,
@@ -451,12 +402,7 @@ def is_real_camera_footage(hit):
 
 
 def download_visual_background(target_duration):
-    """
-    1) Downloads Google Drive background video if drive_video_url is provided
-    2) Checks local 'videos/' folder if present
-    3) Falls back to Pixabay real camera footage (bearded dragon / reptile / nature)
-    Always removes original audio (-an).
-    """
+    """Downloads Google Drive video first, strips original audio (-an), and falls back to Pixabay real footage."""
     if drive_video_url and drive_video_url.startswith("http"):
         try:
             print(f"Downloading Google Drive video: {drive_video_url}")
@@ -584,9 +530,9 @@ def fetch_relaxing_piano(target_duration):
 
 def build_background_video_graph(raw_vid_dur, total_dur):
     """
-    - If video is shorter than voiceover target duration: plays forward, then 2nd time in reverse.
-    - If video is longer than voiceover: plays naturally to the end with relaxing piano music.
-    - Zero dark effect or extra color/noise/vignette effects applied to background video.
+    - Video shorter than voiceover -> plays forward, then 2nd time in reverse.
+    - Video longer than voiceover -> continues playing to end with relaxing piano music.
+    - Zero dark overlay, vignette, grain, or color effects applied to background video.
     """
     base_prep = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=30"
     if raw_vid_dur < total_dur and raw_vid_dur > 0.2:
@@ -650,16 +596,12 @@ def render_ffmpeg(piano_file, vo_duration, total_duration, sentence_start_times)
     drawtext_filters_str = ",".join(drawtext_filters)
     bg_graph = build_background_video_graph(raw_vid_duration, total_duration)
 
-    v_filter = (
-        f"{bg_graph},"
-        f"{drawtext_filters_str}[v]"
-    )
+    v_filter = f"{bg_graph},{drawtext_filters_str}[v]"
 
     vo_start = VO_START_DELAY
     vo_end = VO_START_DELAY + vo_duration
     adelay_ms = int(VO_START_DELAY * 1000)
 
-    # Relaxing piano music plays throughout; ducks gently during voiceover and continues to end after voiceover
     piano_vol_expr = f"if(between(t,{vo_start:.2f},{vo_end:.2f}),0.20,0.38)"
 
     a_filter = (
@@ -793,21 +735,19 @@ def upload_video_with_fallback():
 def main():
     ensure_assets()
 
-    # Step 1: Generate voiceover first so we know its exact duration
+    # Step 1: Generate English voiceover first so we know its exact duration
     sentence_start_times = generate_kokoro_asmr_voiceover(overlay_text)
     vo_duration = get_duration("voice.mp3")
     vo_end = round(VO_START_DELAY + vo_duration, 2)
 
-    # Step 2: Fetch background video (original sound removed) first so we can compare video vs voiceover duration
+    # Step 2: Fetch background video (original sound removed) to compare video vs voiceover duration
     download_visual_background(max(MIN_VIDEO_DURATION, vo_end + EXTRA_TAIL_SECONDS))
     raw_vid_duration = get_duration("raw_video.mp4")
 
     if raw_vid_duration > vo_end:
-        # Video is longer than voiceover -> continue video to end with relaxing piano music
         total_duration = max(MIN_VIDEO_DURATION, round(raw_vid_duration, 2))
         print(f"Video ({raw_vid_duration:.2f}s) > Voiceover end ({vo_end:.2f}s): continuing video to {total_duration:.2f}s with relaxing piano.")
     else:
-        # Video is shorter than voiceover -> play 2nd time in reverse
         total_duration = max(MIN_VIDEO_DURATION, round(vo_end + EXTRA_TAIL_SECONDS, 2))
         print(f"Video ({raw_vid_duration:.2f}s) < Voiceover end ({vo_end:.2f}s): playing 2nd time in reverse up to {total_duration:.2f}s.")
 
