@@ -5,7 +5,6 @@ import glob
 import json
 import math
 import random
-import urllib.parse
 import textwrap
 import requests
 import subprocess
@@ -107,15 +106,23 @@ else:
     except Exception:
         overlay_text = BEARDED_DRAGON_SCRIPTS[0]
 
-search_keyword = str(payload.get("search_keyword", "bearded dragon")).strip() or "bearded dragon"
-fallback_keyword = str(payload.get("fallback_keyword", "reptile")).strip() or "reptile"
 drive_video_url = str(payload.get("drive_video_url", "")).strip()
+raw_drive_pool = payload.get("drive_video_pool", [])
+if isinstance(raw_drive_pool, str):
+    try:
+        drive_video_pool = json.loads(raw_drive_pool)
+    except Exception:
+        drive_video_pool = [u.strip() for u in raw_drive_pool.split(",") if u.strip()]
+elif isinstance(raw_drive_pool, list):
+    drive_video_pool = [str(u).strip() for u in raw_drive_pool if str(u).strip()]
+else:
+    drive_video_pool = []
+
 caption = str(payload.get(
     "caption",
     "Quiet basking moments with a bearded dragon.\n\nTag a fellow beardie lover.\n\n#beardeddragon #beardie #reptilelover #petreels"
 )).strip()
 
-PIXABAY_API_KEY = os.environ.get("PIXABAY_API_KEY", "").strip().strip('"').strip("'")
 FREESOUND_API_KEY = os.environ.get("FREESOUND_API_KEY", "").strip().strip('"').strip("'")
 
 PRIMARY_MAKE_WEBHOOK = "https://hook.us2.make.com/ga5opcigaf8fw3keq4zh5x5uy2r6gs24"
@@ -128,14 +135,7 @@ VO_START_DELAY = 0.6          # Voiceover starts at 0.6 seconds
 EXTRA_TAIL_SECONDS = 2.0      # Tail when video is shorter than voiceover
 AUDIO_FADE_DURATION = 1.50    # Smooth 1.50s audio fade-out at the end
 MIN_VIDEO_DURATION = 12.0     # Minimum reel length in seconds
-
-BANNED_VISUAL_TAGS = {
-    "animation", "animated", "cartoon", "anime", "3d", "cgi", "render",
-    "illustration", "drawing", "sketch", "painting", "art", "abstract",
-    "fractal", "vj", "neon", "cyberpunk", "sci-fi", "fantasy", "ai",
-    "generated", "digital", "graphic", "motion graphics", "particles",
-    "matrix", "tunnel", "kaleidoscope", "geometry", "game", "virtual"
-}
+USED_VIDEOS_TRACKER_FILE = "used_background_videos.json"
 
 
 def ensure_assets():
@@ -389,85 +389,96 @@ def download_from_google_drive(url, dest_path="drive_raw.mp4"):
     return False
 
 
-def is_real_camera_footage(hit):
-    hit_type = str(hit.get("type", "")).lower()
-    if "animation" in hit_type or "illustration" in hit_type:
-        return False
-    tags_str = str(hit.get("tags", "")).lower()
-    tag_tokens = {t.strip() for t in tags_str.split(",") if t.strip()}
-    for banned in BANNED_VISUAL_TAGS:
-        if banned in tag_tokens or re.search(rf'\b{re.escape(banned)}\b', tags_str):
-            return False
-    return True
+def load_used_video_ids():
+    if os.path.exists(USED_VIDEOS_TRACKER_FILE):
+        try:
+            with open(USED_VIDEOS_TRACKER_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    return data
+        except Exception:
+            pass
+    return []
+
+
+def save_used_video_ids(used_list):
+    try:
+        with open(USED_VIDEOS_TRACKER_FILE, "w", encoding="utf-8") as f:
+            json.dump(used_list, f, indent=2)
+    except Exception as e:
+        print(f"Could not save used videos tracker: {e}")
+
+
+def extract_video_key(source_str):
+    m = re.search(r'[?&]id=([a-zA-Z0-9_-]+)', source_str)
+    if m:
+        return f"gdrive:{m.group(1)}"
+    return f"file:{os.path.abspath(source_str)}"
+
+
+def pick_unique_video(candidates):
+    """
+    Selects a unique video from candidates that has not been used yet.
+    Once all candidates have been used, resets the history so rotation continues cleanly.
+    """
+    used = load_used_video_ids()
+    unused = [c for c in candidates if extract_video_key(c) not in used]
+
+    if not unused:
+        print("All videos in pool have been used once; resetting unique video history.")
+        used = []
+        unused = list(candidates)
+
+    chosen = random.choice(unused)
+    chosen_key = extract_video_key(chosen)
+    used.append(chosen_key)
+    save_used_video_ids(used)
+    print(f"Selected UNIQUE background video: {chosen} (used {len(used)}/{len(candidates)} in current cycle)")
+    return chosen
 
 
 def download_visual_background(target_duration):
-    """Downloads Google Drive video first, strips original audio (-an), and falls back to Pixabay real footage."""
-    if drive_video_url and drive_video_url.startswith("http"):
-        try:
-            print(f"Downloading Google Drive video: {drive_video_url}")
-            if download_from_google_drive(drive_video_url, "drive_raw.mp4"):
-                strip_original_audio("drive_raw.mp4", "raw_video.mp4")
-                return
-        except Exception as e_drv:
-            print(f"Google Drive download failed ({e_drv}), trying fallback...")
+    """
+    Selects a unique background video from your Google Drive pool/URL or local 'videos/' folder
+    and strips its original sound (-an). Never uses Pixabay or stock image fallbacks.
+    """
+    candidates = []
+    if drive_video_pool:
+        for u in drive_video_pool:
+            if u.startswith("http") and u not in candidates:
+                candidates.append(u)
+    if drive_video_url and drive_video_url.startswith("http") and drive_video_url not in candidates:
+        candidates.append(drive_video_url)
+
+    if candidates:
+        ordered_urls = [pick_unique_video(candidates)] + [u for u in candidates if extract_video_key(u) != extract_video_key(candidates[0])]
+        for idx_u, u in enumerate(ordered_urls):
+            target_u = pick_unique_video(candidates) if idx_u == 0 else u
+            try:
+                if download_from_google_drive(target_u, "drive_raw.mp4"):
+                    strip_original_audio("drive_raw.mp4", "raw_video.mp4")
+                    return
+            except Exception as e_drv:
+                print(f"Google Drive download failed for {target_u}: {e_drv}")
 
     video_exts = (".mp4", ".mov", ".mkv", ".webm")
+    local_videos = []
     for folder in ["videos", "backgrounds", "clips"]:
         if os.path.isdir(folder):
-            found = [
-                os.path.join(folder, f) for f in sorted(os.listdir(folder))
-                if f.lower().endswith(video_exts) and os.path.getsize(os.path.join(folder, f)) > 50_000
-            ]
-            if found:
-                idx = (max(1, int(row_id)) - 1) % len(found)
-                strip_original_audio(found[idx], "raw_video.mp4")
-                return
+            for fname in sorted(os.listdir(folder)):
+                full_p = os.path.join(folder, fname)
+                if fname.lower().endswith(video_exts) and os.path.isfile(full_p) and os.path.getsize(full_p) > 50_000:
+                    local_videos.append(full_p)
 
-    if PIXABAY_API_KEY:
-        try:
-            queries = [
-                urllib.parse.quote(search_keyword),
-                urllib.parse.quote(fallback_keyword),
-                "bearded+dragon",
-                "lizard+reptile",
-                "calm+nature+sunlight"
-            ]
-            for orientation_param in ["&orientation=vertical", ""]:
-                for q in queries:
-                    if not q:
-                        continue
-                    url = (
-                        f"https://pixabay.com/api/videos/?key={PIXABAY_API_KEY}"
-                        f"&q={q}&video_type=film{orientation_param}&per_page=25&safesearch=true"
-                    )
-                    r = requests.get(url, timeout=20)
-                    raw_hits = r.json().get("hits", []) if r.status_code == 200 else []
-                    real_hits = [h for h in raw_hits if is_real_camera_footage(h)]
-                    if real_hits:
-                        chosen = random.choice(real_hits[:5])
-                        vids = chosen.get("videos", {})
-                        v_url = (
-                            vids.get("large", {}).get("url")
-                            or vids.get("medium", {}).get("url")
-                            or vids.get("small", {}).get("url")
-                        )
-                        if v_url:
-                            vid_data = requests.get(v_url, timeout=60).content
-                            if len(vid_data) > 50_000:
-                                with open("pixabay_raw.mp4", "wb") as f:
-                                    f.write(vid_data)
-                                strip_original_audio("pixabay_raw.mp4", "raw_video.mp4")
-                                return
-        except Exception as e:
-            print(f"Pixabay search warning: {e}")
+    if local_videos:
+        chosen_local = pick_unique_video(local_videos)
+        strip_original_audio(chosen_local, "raw_video.mp4")
+        return
 
-    subprocess.run([
-        "ffmpeg", "-y", "-f", "lavfi",
-        "-i", f"color=c=#141414:s=1080x1920:r=30:d={target_duration:.2f}",
-        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
-        "-an", "raw_video.mp4"
-    ], check=True)
+    raise RuntimeError(
+        "No unique background video found! Provide drive_video_url / drive_video_pool from Google Drive "
+        "or upload video files to the 'videos/' folder."
+    )
 
 
 def fetch_relaxing_piano(target_duration):
@@ -528,14 +539,14 @@ def fetch_relaxing_piano(target_duration):
     return "synth_piano.mp3"
 
 
-def build_background_video_graph(raw_vid_dur, total_dur):
+def build_background_video_graph(raw_vid_dur, vo_end_time, total_dur):
     """
-    - Video shorter than voiceover -> plays forward, then 2nd time in reverse.
-    - Video longer than voiceover -> continues playing to end with relaxing piano music.
+    - Video shorter than voiceover (raw_vid_dur < vo_end_time) -> plays forward, then 2nd time in reverse.
+    - Video longer than voiceover (raw_vid_dur >= vo_end_time) -> continues playing to end with relaxing piano.
     - Zero dark overlay, vignette, grain, or color effects applied to background video.
     """
     base_prep = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=30"
-    if raw_vid_dur < total_dur and raw_vid_dur > 0.2:
+    if raw_vid_dur < vo_end_time and raw_vid_dur > 0.2:
         pairs = max(1, math.ceil(total_dur / (2.0 * raw_vid_dur)))
         total_splits = pairs * 2
         split_labels = "".join(f"[s{i}]" for i in range(total_splits))
@@ -549,8 +560,8 @@ def build_background_video_graph(raw_vid_dur, total_dur):
             chain_parts.append(f"{f_in}setpts=PTS-STARTPTS{f_out}")
             chain_parts.append(f"{r_in}reverse,setpts=PTS-STARTPTS{r_out}")
             concat_inputs += f"{f_out}{r_out}"
-        return f"[0:v]{base_prep},split={total_splits}{split_labels};" + ";".join(chain_parts) + f";{concat_inputs}concat=n={total_splits}:v=1:a=0[vbg]"
-    return f"[0:v]{base_prep},setpts=PTS-STARTPTS[vbg]"
+        return f"[0:v]{base_prep},split={total_splits}{split_labels};" + ";".join(chain_parts) + f";{concat_inputs}concat=n={total_splits}:v=1:a=0[vbg];"
+    return f"[0:v]{base_prep},setpts=PTS-STARTPTS[vbg];"
 
 
 def render_ffmpeg(piano_file, vo_duration, total_duration, sentence_start_times):
@@ -594,13 +605,12 @@ def render_ffmpeg(piano_file, vo_duration, total_duration, sentence_start_times)
         )
 
     drawtext_filters_str = ",".join(drawtext_filters)
-    bg_graph = build_background_video_graph(raw_vid_duration, total_duration)
-
-    v_filter = f"{bg_graph},{drawtext_filters_str}[v]"
-
     vo_start = VO_START_DELAY
-    vo_end = VO_START_DELAY + vo_duration
+    vo_end = round(VO_START_DELAY + vo_duration, 2)
     adelay_ms = int(VO_START_DELAY * 1000)
+
+    bg_graph = build_background_video_graph(raw_vid_duration, vo_end, total_duration)
+    v_filter = f"{bg_graph}[vbg]{drawtext_filters_str}[v]"
 
     piano_vol_expr = f"if(between(t,{vo_start:.2f},{vo_end:.2f}),0.20,0.38)"
 
@@ -740,7 +750,7 @@ def main():
     vo_duration = get_duration("voice.mp3")
     vo_end = round(VO_START_DELAY + vo_duration, 2)
 
-    # Step 2: Fetch background video (original sound removed) to compare video vs voiceover duration
+    # Step 2: Fetch unique background video (original sound removed) to compare video vs voiceover duration
     download_visual_background(max(MIN_VIDEO_DURATION, vo_end + EXTRA_TAIL_SECONDS))
     raw_vid_duration = get_duration("raw_video.mp4")
 
