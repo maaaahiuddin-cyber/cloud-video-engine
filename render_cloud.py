@@ -107,17 +107,6 @@ else:
         overlay_text = BEARDED_DRAGON_SCRIPTS[0]
 
 drive_video_url = str(payload.get("drive_video_url", "")).strip()
-raw_drive_pool = payload.get("drive_video_pool", [])
-if isinstance(raw_drive_pool, str):
-    try:
-        drive_video_pool = json.loads(raw_drive_pool)
-    except Exception:
-        drive_video_pool = [u.strip() for u in raw_drive_pool.split(",") if u.strip()]
-elif isinstance(raw_drive_pool, list):
-    drive_video_pool = [str(u).strip() for u in raw_drive_pool if str(u).strip()]
-else:
-    drive_video_pool = []
-
 caption = str(payload.get(
     "caption",
     "Quiet basking moments with a bearded dragon.\n\nTag a fellow beardie lover.\n\n#beardeddragon #beardie #reptilelover #petreels"
@@ -135,7 +124,6 @@ VO_START_DELAY = 0.6          # Voiceover starts at 0.6 seconds
 EXTRA_TAIL_SECONDS = 2.0      # Tail when video is shorter than voiceover
 AUDIO_FADE_DURATION = 1.50    # Smooth 1.50s audio fade-out at the end
 MIN_VIDEO_DURATION = 12.0     # Minimum reel length in seconds
-USED_VIDEOS_TRACKER_FILE = "used_background_videos.json"
 
 
 def ensure_assets():
@@ -190,51 +178,6 @@ def get_quote_font_path():
     return "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf"
 
 
-def prepare_overlay_lines(body_text, sentence_start_times=None):
-    """
-    Prepares ONLY the English overlay text lines (no title, no watermark, no end text)
-    for center-bottom placement.
-    """
-    cleaned = (body_text or "").replace("\r\n", "\n").replace("\u2028", "\n").replace("\u2029", "\n").strip()
-    if not cleaned:
-        cleaned = BEARDED_DRAGON_SCRIPTS[0]
-
-    raw_lines = [l.strip() for l in cleaned.split("\n") if l.strip()]
-    if len(raw_lines) == 1 and ". " in cleaned:
-        lines_source = [s.strip() for s in re.split(r'(?<=[.!?])\s+', cleaned) if s.strip()]
-    else:
-        lines_source = raw_lines
-
-    items = []
-    current_y = 0
-    line_height = 56
-    file_idx = 0
-
-    for idx, src_line in enumerate(lines_source):
-        if sentence_start_times and idx < len(sentence_start_times):
-            base_t = sentence_start_times[idx]
-        else:
-            base_t = round(VO_START_DELAY + (idx * 1.9), 2)
-
-        wrapped = textwrap.wrap(src_line, width=32) or [src_line]
-        for w_idx, w_line in enumerate(wrapped):
-            fname = f"overlay_line_{file_idx}.txt"
-            with open(fname, "w", encoding="utf-8", newline="\n") as f:
-                f.write(w_line)
-            items.append({
-                "fname": fname,
-                "rel_y": current_y,
-                "fontsize": 44,
-                "fontcolor": "#FFFFFF",
-                "start_t": round(base_t + (w_idx * 0.18), 2)
-            })
-            current_y += line_height
-            file_idx += 1
-
-    total_height = max(current_y, line_height)
-    return items, total_height
-
-
 def get_duration(filename):
     try:
         out = subprocess.check_output([
@@ -247,14 +190,17 @@ def get_duration(filename):
 
 
 def generate_kokoro_asmr_voiceover(text):
-    """Generates pure English Kokoro-82M voiceover directly from Overlay_Text."""
+    """
+    Generates pure English Kokoro-82M voiceover line-by-line and returns a list of
+    (start_sec, end_sec) tuples so only one line appears on screen at a time with its voice.
+    """
     clean_spoken = re.sub(r'\s{2,}', ' ', (text or "").replace("…", ", ").replace("...", ", ")).strip()
     chunks = re.split(r'(?<=[.!?])\s+|\n+', clean_spoken.replace("\r", ""))
     phrases = [c.strip() for c in chunks if c.strip()]
     if not phrases:
         phrases = ["Back leg stretched out so neat."]
 
-    sentence_start_times = []
+    line_windows = []
     raw_gen = False
     try:
         kokoro = Kokoro("kokoro-v1.0.int8.onnx", "voices-v1.0.bin")
@@ -275,7 +221,6 @@ def generate_kokoro_asmr_voiceover(text):
             phrase_speed = 0.80 if is_final else 0.84
 
             sent_start_sec = round(VO_START_DELAY + (cumulative_samples / float(sample_rate)), 2)
-            sentence_start_times.append(sent_start_sec)
 
             samples, sample_rate = kokoro.create(
                 phrase,
@@ -285,6 +230,9 @@ def generate_kokoro_asmr_voiceover(text):
             )
             audio_segments.append(samples)
             cumulative_samples += len(samples)
+            sent_end_sec = round(VO_START_DELAY + (cumulative_samples / float(sample_rate)), 2)
+            line_windows.append((sent_start_sec, sent_end_sec))
+            print(f"Line {i+1} voice window: {sent_start_sec:.2f}s -> {sent_end_sec:.2f}s | '{phrase}'")
 
             if i < total_phrases - 1:
                 pause_sec = 1.25 if (i + 1 == total_phrases - 1) else 0.85
@@ -335,15 +283,78 @@ def generate_kokoro_asmr_voiceover(text):
             "ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo:d=10.0", "voice.mp3"
         ], check=True)
 
-    if not sentence_start_times:
+    if not line_windows:
         vo_dur = get_duration("voice.mp3")
         total_chars = max(sum(len(p) for p in phrases), 1)
         elapsed = 0.0
         for p in phrases:
-            sentence_start_times.append(round(VO_START_DELAY + elapsed, 2))
-            elapsed += (len(p) / total_chars) * vo_dur
+            dur_p = (len(p) / total_chars) * vo_dur
+            line_windows.append((round(VO_START_DELAY + elapsed, 2), round(VO_START_DELAY + elapsed + dur_p, 2)))
+            elapsed += dur_p
 
-    return sentence_start_times
+    return line_windows
+
+
+def prepare_single_line_overlays(body_text, line_windows):
+    """
+    Prepares each line so ONLY that line shows while its voiceover plays,
+    and the previous line disappears right before the next line begins.
+    """
+    cleaned = (body_text or "").replace("\r\n", "\n").replace("\u2028", "\n").replace("\u2029", "\n").strip()
+    if not cleaned:
+        cleaned = BEARDED_DRAGON_SCRIPTS[0]
+
+    raw_lines = [l.strip() for l in cleaned.split("\n") if l.strip()]
+    if len(raw_lines) == 1 and ". " in cleaned:
+        lines_source = [s.strip() for s in re.split(r'(?<=[.!?])\s+', cleaned) if s.strip()]
+    else:
+        lines_source = raw_lines
+
+    n = len(lines_source)
+    slots = []
+    for idx, src_line in enumerate(lines_source):
+        if line_windows and idx < len(line_windows):
+            s_t, e_t = line_windows[idx]
+        else:
+            s_t = round(VO_START_DELAY + (idx * 2.2), 2)
+            e_t = round(s_t + 1.8, 2)
+        slots.append({"text": src_line, "start_t": s_t, "end_t": e_t})
+
+    rendered_slots = []
+    file_idx = 0
+    for idx, sl in enumerate(slots):
+        start_t = sl["start_t"]
+        if idx < n - 1:
+            next_start = slots[idx + 1]["start_t"]
+            hide_t = round(max(start_t + 0.50, next_start - 0.12), 2)
+        else:
+            hide_t = None  # Last line stays until end fade-out
+
+        wrapped = textwrap.wrap(sl["text"], width=32) or [sl["text"]]
+        sub_count = len(wrapped)
+        sub_span = max(0.30, ((hide_t if hide_t is not None else (start_t + 2.2)) - start_t) / sub_count)
+
+        for w_idx, w_line in enumerate(wrapped):
+            w_start = round(start_t + (w_idx * sub_span), 2)
+            if w_idx < sub_count - 1:
+                w_hide = round(max(w_start + 0.25, start_t + ((w_idx + 1) * sub_span) - 0.05), 2)
+            else:
+                w_hide = hide_t
+
+            fname = f"overlay_line_{file_idx}.txt"
+            with open(fname, "w", encoding="utf-8", newline="\n") as f:
+                f.write(w_line)
+
+            rendered_slots.append({
+                "fname": fname,
+                "fontsize": 44,
+                "fontcolor": "#FFFFFF",
+                "start_t": w_start,
+                "hide_t": w_hide
+            })
+            file_idx += 1
+
+    return rendered_slots
 
 
 def strip_original_audio(input_path, output_path="raw_video.mp4"):
@@ -389,96 +400,30 @@ def download_from_google_drive(url, dest_path="drive_raw.mp4"):
     return False
 
 
-def load_used_video_ids():
-    if os.path.exists(USED_VIDEOS_TRACKER_FILE):
-        try:
-            with open(USED_VIDEOS_TRACKER_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, list):
-                    return data
-        except Exception:
-            pass
-    return []
-
-
-def save_used_video_ids(used_list):
-    try:
-        with open(USED_VIDEOS_TRACKER_FILE, "w", encoding="utf-8") as f:
-            json.dump(used_list, f, indent=2)
-    except Exception as e:
-        print(f"Could not save used videos tracker: {e}")
-
-
-def extract_video_key(source_str):
-    m = re.search(r'[?&]id=([a-zA-Z0-9_-]+)', source_str)
-    if m:
-        return f"gdrive:{m.group(1)}"
-    return f"file:{os.path.abspath(source_str)}"
-
-
-def pick_unique_video(candidates):
-    """
-    Selects a unique video from candidates that has not been used yet.
-    Once all candidates have been used, resets the history so rotation continues cleanly.
-    """
-    used = load_used_video_ids()
-    unused = [c for c in candidates if extract_video_key(c) not in used]
-
-    if not unused:
-        print("All videos in pool have been used once; resetting unique video history.")
-        used = []
-        unused = list(candidates)
-
-    chosen = random.choice(unused)
-    chosen_key = extract_video_key(chosen)
-    used.append(chosen_key)
-    save_used_video_ids(used)
-    print(f"Selected UNIQUE background video: {chosen} (used {len(used)}/{len(candidates)} in current cycle)")
-    return chosen
-
-
 def download_visual_background(target_duration):
-    """
-    Selects a unique background video from your Google Drive pool/URL or local 'videos/' folder
-    and strips its original sound (-an). Never uses Pixabay or stock image fallbacks.
-    """
-    candidates = []
-    if drive_video_pool:
-        for u in drive_video_pool:
-            if u.startswith("http") and u not in candidates:
-                candidates.append(u)
-    if drive_video_url and drive_video_url.startswith("http") and drive_video_url not in candidates:
-        candidates.append(drive_video_url)
-
-    if candidates:
-        ordered_urls = [pick_unique_video(candidates)] + [u for u in candidates if extract_video_key(u) != extract_video_key(candidates[0])]
-        for idx_u, u in enumerate(ordered_urls):
-            target_u = pick_unique_video(candidates) if idx_u == 0 else u
-            try:
-                if download_from_google_drive(target_u, "drive_raw.mp4"):
-                    strip_original_audio("drive_raw.mp4", "raw_video.mp4")
-                    return
-            except Exception as e_drv:
-                print(f"Google Drive download failed for {target_u}: {e_drv}")
+    """Downloads Google Drive background video first, strips original audio (-an), or uses local videos/."""
+    if drive_video_url and drive_video_url.startswith("http"):
+        try:
+            print(f"Downloading Google Drive video: {drive_video_url}")
+            if download_from_google_drive(drive_video_url, "drive_raw.mp4"):
+                strip_original_audio("drive_raw.mp4", "raw_video.mp4")
+                return
+        except Exception as e_drv:
+            print(f"Google Drive download failed ({e_drv}), checking local videos/...")
 
     video_exts = (".mp4", ".mov", ".mkv", ".webm")
-    local_videos = []
     for folder in ["videos", "backgrounds", "clips"]:
         if os.path.isdir(folder):
-            for fname in sorted(os.listdir(folder)):
-                full_p = os.path.join(folder, fname)
-                if fname.lower().endswith(video_exts) and os.path.isfile(full_p) and os.path.getsize(full_p) > 50_000:
-                    local_videos.append(full_p)
+            found = [
+                os.path.join(folder, f) for f in sorted(os.listdir(folder))
+                if f.lower().endswith(video_exts) and os.path.getsize(os.path.join(folder, f)) > 50_000
+            ]
+            if found:
+                idx = (max(1, int(row_id)) - 1) % len(found)
+                strip_original_audio(found[idx], "raw_video.mp4")
+                return
 
-    if local_videos:
-        chosen_local = pick_unique_video(local_videos)
-        strip_original_audio(chosen_local, "raw_video.mp4")
-        return
-
-    raise RuntimeError(
-        "No unique background video found! Provide drive_video_url / drive_video_pool from Google Drive "
-        "or upload video files to the 'videos/' folder."
-    )
+    raise RuntimeError("No background video found! Provide drive_video_url from Google Drive or upload clips to videos/.")
 
 
 def fetch_relaxing_piano(target_duration):
@@ -564,43 +509,57 @@ def build_background_video_graph(raw_vid_dur, vo_end_time, total_dur):
     return f"[0:v]{base_prep},setpts=PTS-STARTPTS[vbg];"
 
 
-def render_ffmpeg(piano_file, vo_duration, total_duration, sentence_start_times):
+def render_ffmpeg(piano_file, vo_duration, total_duration, line_windows):
     raw_vid_duration = get_duration("raw_video.mp4")
     piano_dur = get_duration(piano_file)
     max_offset = max(0.0, piano_dur - total_duration - 2.0)
     piano_start = random.uniform(0.0, max_offset) if max_offset > 4.0 else 0.0
 
-    line_items, total_height = prepare_overlay_lines(overlay_text, sentence_start_times)
+    rendered_slots = prepare_single_line_overlays(overlay_text, line_windows)
     quote_font = get_quote_font_path()
 
-    # Center-bottom positioning on 1080x1920 frame
-    bottom_margin = 230
-    base_y = max(120, 1920 - bottom_margin - total_height)
+    # Single-line center-bottom Y coordinate on 1080x1920 frame
+    y_pos = 1920 - 260
 
     audio_fade_start = max(total_duration - AUDIO_FADE_DURATION, total_duration - 2.0)
-    text_fade_start = max(total_duration - 0.65, VO_START_DELAY + 2.0)
-    text_fade_end = round(text_fade_start + 0.35, 2)
+    final_text_fade_start = max(total_duration - 0.50, VO_START_DELAY + 1.0)
+    final_text_fade_end = round(final_text_fade_start + 0.35, 2)
 
     drawtext_filters = []
-    for item in line_items:
-        start_t = item["start_t"]
-        fade_in_end = round(start_t + 0.45, 2)
-        line_alpha = (
-            f"if(lt(t,{start_t:.2f}),0,"
-            f"if(lt(t,{fade_in_end:.2f}),(t-{start_t:.2f})/0.45,"
-            f"if(lt(t,{text_fade_start:.2f}),1,"
-            f"if(lt(t,{text_fade_end:.2f}),({text_fade_end:.2f}-t)/0.35,0))))"
-        )
-        y_pos = base_y + item["rel_y"]
+    for sl in rendered_slots:
+        start_t = sl["start_t"]
+        hide_t = sl["hide_t"]
+        fade_in_dur = 0.25
+        fade_in_end = round(start_t + fade_in_dur, 2)
+
+        if hide_t is not None:
+            fade_out_dur = 0.15
+            fade_out_start = round(max(fade_in_end + 0.05, hide_t - fade_out_dur), 2)
+            line_alpha = (
+                f"if(lt(t,{start_t:.2f}),0,"
+                f"if(lt(t,{fade_in_end:.2f}),(t-{start_t:.2f})/{fade_in_dur:.2f},"
+                f"if(lt(t,{fade_out_start:.2f}),1,"
+                f"if(lt(t,{hide_t:.2f}),({hide_t:.2f}-t)/{fade_out_dur:.2f},0))))"
+            )
+            enable_expr = f"between(t,{start_t:.2f},{hide_t:.2f})"
+        else:
+            line_alpha = (
+                f"if(lt(t,{start_t:.2f}),0,"
+                f"if(lt(t,{fade_in_end:.2f}),(t-{start_t:.2f})/{fade_in_dur:.2f},"
+                f"if(lt(t,{final_text_fade_start:.2f}),1,"
+                f"if(lt(t,{final_text_fade_end:.2f}),({final_text_fade_end:.2f}-t)/0.35,0))))"
+            )
+            enable_expr = f"gte(t,{start_t:.2f})"
+
         drawtext_filters.append(
             f"drawtext=fontfile={quote_font}:"
-            f"textfile={item['fname']}:"
-            f"fontcolor={item['fontcolor']}:"
-            f"fontsize={item['fontsize']}:"
+            f"textfile={sl['fname']}:"
+            f"fontcolor={sl['fontcolor']}:"
+            f"fontsize={sl['fontsize']}:"
             f"x=(w-text_w)/2:"
             f"y={y_pos}:"
             f"shadowcolor=black@0.90:shadowx=3:shadowy=4:"
-            f"enable='gte(t,{start_t:.2f})':"
+            f"enable='{enable_expr}':"
             f"alpha='{line_alpha}'"
         )
 
@@ -745,12 +704,12 @@ def upload_video_with_fallback():
 def main():
     ensure_assets()
 
-    # Step 1: Generate English voiceover first so we know its exact duration
-    sentence_start_times = generate_kokoro_asmr_voiceover(overlay_text)
+    # Step 1: Generate English voiceover line-by-line and capture each line's start/end window
+    line_windows = generate_kokoro_asmr_voiceover(overlay_text)
     vo_duration = get_duration("voice.mp3")
     vo_end = round(VO_START_DELAY + vo_duration, 2)
 
-    # Step 2: Fetch unique background video (original sound removed) to compare video vs voiceover duration
+    # Step 2: Fetch background video (original sound removed) and set duration behavior
     download_visual_background(max(MIN_VIDEO_DURATION, vo_end + EXTRA_TAIL_SECONDS))
     raw_vid_duration = get_duration("raw_video.mp4")
 
@@ -763,8 +722,8 @@ def main():
 
     piano_file = fetch_relaxing_piano(total_duration)
 
-    # Step 3: Render final video (center-bottom shadowed overlay text, no title/watermark/end text, no video effects)
-    render_ffmpeg(piano_file, vo_duration, total_duration, sentence_start_times)
+    # Step 3: Render final video showing only one overlay line at a time synced with voiceover
+    render_ffmpeg(piano_file, vo_duration, total_duration, line_windows)
     video_url = upload_video_with_fallback()
     print(f"Final Hosted Video URL: {video_url}")
 
