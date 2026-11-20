@@ -1,198 +1,22 @@
-import os
-import re
-import sys
-import glob
-import json
-import math
-import random
-import textwrap
-import requests
-import subprocess
-
-# Auto-install required packages if missing in workflow YAML
-try:
-    import soundfile as sf
-    import numpy as np
-    from kokoro_onnx import Kokoro
-except ImportError:
-    subprocess.run([
-        sys.executable, "-m", "pip", "install",
-        "kokoro-onnx", "soundfile", "numpy", "edge-tts", "gTTS"
-    ], check=True)
-    import soundfile as sf
-    import numpy as np
-    from kokoro_onnx import Kokoro
-
-# 1. Auto-sanitize CLOUDINARY_URL BEFORE importing cloudinary
-raw_cloud = os.environ.get("CLOUDINARY_URL", "").strip().strip('"').strip("'")
-if raw_cloud.startswith("CLOUDINARY_URL="):
-    raw_cloud = raw_cloud.split("CLOUDINARY_URL=", 1)[1].strip().strip('"').strip("'")
-os.environ["CLOUDINARY_URL"] = raw_cloud
-
-import cloudinary
-import cloudinary.uploader
-
-try:
-    if raw_cloud.startswith("cloudinary://") and "@" in raw_cloud:
-        creds, cloud_name = raw_cloud.replace("cloudinary://", "", 1).split("@", 1)
-        api_key, api_secret = creds.split(":", 1)
-        cloudinary.config(
-            cloud_name=cloud_name.strip(),
-            api_key=api_key.strip(),
-            api_secret=api_secret.strip(),
-            secure=True
-        )
-except Exception as e:
-    print(f"Cloudinary URL parse warning: {e}")
-
-# 2. Load payload sent from Google Sheets
-raw_payload = os.environ.get("PAYLOAD_JSON", "{}")
-try:
-    payload = json.loads(raw_payload) if raw_payload else {}
-except Exception:
-    payload = {}
-
-BEARDED_DRAGON_SCRIPTS = [
-    (
-        "Back leg stretched out so neat\n"
-        "Resting on warm sunny feet\n"
-        "Zero worries in the whole wide room\n"
-        "Pure comfort in the afternoon\n"
-        "A little dinosaur full of grace\n"
-        "Stealing hearts in every place"
-    ),
-    (
-        "Warm heat lamp glowing bright\n"
-        "Tiny dragon basking in the light\n"
-        "One slow blink and a judging side-eye\n"
-        "Living the royal reptile life\n"
-        "No rent, no rush, just warm rocks\n"
-        "My scaly little best friend"
-    ),
-    (
-        "Slow head tilt when I walk by\n"
-        "Deep dark eyes that never lie\n"
-        "Listening closely to every sound\n"
-        "The sweetest companion I ever found\n"
-        "Curious heart in a spiky coat\n"
-        "Taking in every word I spoke"
-    ),
-    (
-        "Sunbeam warming up the floor\n"
-        "Nothing else could matter more\n"
-        "A quiet pause in a busy day\n"
-        "Watching my little dragon stay\n"
-        "Gentle company, soft and slow\n"
-        "The sweetest calm I'll ever know"
-    ),
-    (
-        "Lights dim low as evening falls\n"
-        "Soft shadows dance across the walls\n"
-        "Curled up snug in a cozy spot\n"
-        "The gentlest little soul I've got\n"
-        "Drift into a peaceful dream\n"
-        "Brighter than a golden beam"
-    ),
-]
-
-row_id = str(payload.get("row_id", "1")).strip()
-niche = str(payload.get("niche", "bearded dragon")).strip() or "bearded dragon"
-raw_overlay_input = str(payload.get("overlay_text", "")).strip()
-if raw_overlay_input:
-    overlay_text = raw_overlay_input
-else:
-    try:
-        overlay_text = BEARDED_DRAGON_SCRIPTS[(max(1, int(row_id)) - 1) % len(BEARDED_DRAGON_SCRIPTS)]
-    except Exception:
-        overlay_text = BEARDED_DRAGON_SCRIPTS[0]
-
-drive_video_url = str(payload.get("drive_video_url", "")).strip()
-caption = str(payload.get(
-    "caption",
-    "Quiet basking moments with a bearded dragon.\n\nTag a fellow beardie lover.\n\n#beardeddragon #beardie #reptilelover #petreels"
-)).strip()
-
-FREESOUND_API_KEY = os.environ.get("FREESOUND_API_KEY", "").strip().strip('"').strip("'")
-
-PRIMARY_MAKE_WEBHOOK = "https://hook.us2.make.com/ga5opcigaf8fw3keq4zh5x5uy2r6gs24"
-raw_webhook = os.environ.get("MAKE_WEBHOOK_URL", "").strip().strip('"').strip("'")
-if raw_webhook.startswith("MAKE_WEBHOOK_URL="):
-    raw_webhook = raw_webhook.split("MAKE_WEBHOOK_URL=", 1)[1].strip().strip('"').strip("'")
-MAKE_WEBHOOK_URL = raw_webhook if raw_webhook.startswith("http") else PRIMARY_MAKE_WEBHOOK
-
-VO_START_DELAY = 0.6          # Voiceover starts at 0.6 seconds
-EXTRA_TAIL_SECONDS = 2.0      # Tail when video is shorter than voiceover
-AUDIO_FADE_DURATION = 1.50    # Smooth 1.50s audio fade-out at the end
-MIN_VIDEO_DURATION = 12.0     # Minimum reel length in seconds
-
-
-def ensure_assets():
-    """Downloads Kokoro-82M ONNX models and serif font."""
-    model_path = "kokoro-v1.0.int8.onnx"
-    voices_path = "voices-v1.0.bin"
-    font_path = "PoetrySerif.ttf"
-
-    if not os.path.exists(model_path) or os.path.getsize(model_path) < 10_000_000:
-        print("Downloading Kokoro-82M int8 model...")
-        r = requests.get(
-            "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.int8.onnx",
-            timeout=120
-        )
-        with open(model_path, "wb") as f:
-            f.write(r.content)
-
-    if not os.path.exists(voices_path) or os.path.getsize(voices_path) < 1_000_000:
-        print("Downloading Kokoro-82M voices pack...")
-        r = requests.get(
-            "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin",
-            timeout=60
-        )
-        with open(voices_path, "wb") as f:
-            f.write(r.content)
-
-    if not os.path.exists(font_path) or os.path.getsize(font_path) < 40_000:
-        font_urls = [
-            "https://raw.githubusercontent.com/google/fonts/main/ofl/crimsontext/CrimsonText-Regular.ttf",
-            "https://raw.githubusercontent.com/google/fonts/main/ofl/lora/Lora%5Bwght%5D.ttf",
-        ]
-        for f_url in font_urls:
-            try:
-                r = requests.get(f_url, timeout=25)
-                if r.status_code == 200 and len(r.content) > 40_000:
-                    with open(font_path, "wb") as f:
-                        f.write(r.content)
-                    break
-            except Exception as e:
-                print(f"Font attempt skipped: {e}")
-
-
-def get_quote_font_path():
-    for p in [
-        "PoetrySerif.ttf",
-        "/usr/share/fonts/truetype/ebgaramond/EBGaramond12-Regular.ttf",
-        "/usr/share/fonts/truetype/noto/NotoSerif-Regular.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf"
-    ]:
-        if os.path.exists(p) and os.path.getsize(p) > 20_000:
-            return p
-    return "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf"
-
-
-def get_duration(filename):
-    try:
-        out = subprocess.check_output([
-            "ffprobe", "-v", "error", "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1", filename
-        ], text=True).strip()
-        return float(out)
-    except Exception:
-        return 10.0
+def apply_emotional_phrasing(phrase, idx, total):
+    """Adds subtle hidden punctuation for natural emotional rise-and-fall without changing on-screen text."""
+    p = phrase.strip()
+    if not p:
+        return p
+    if p[-1] in ".!?…":
+        return p
+    if idx == total - 1:
+        return p + "..."      # Soft lingering exhale on the final line
+    if idx % 2 == 0:
+        return p + ","        # Gentle anticipation on lead-in lines
+    return p + "."            # Warm emotional settle on resolving lines
 
 
 def generate_kokoro_asmr_voiceover(text):
     """
-    Generates pure English Kokoro-82M voiceover line-by-line and returns a list of
-    (start_sec, end_sec) tuples so only one line appears on screen at a time with its voice.
+    Generates a natural, emotional close-mic English whisper using Kokoro-82M
+    (78% af_nicole breathy whisper + 22% af_heart emotional warmth) with dynamic pacing
+    and a high-air ASMR mastering chain.
     """
     clean_spoken = re.sub(r'\s{2,}', ' ', (text or "").replace("…", ", ").replace("...", ", ")).strip()
     chunks = re.split(r'(?<=[.!?])\s+|\n+', clean_spoken.replace("\r", ""))
@@ -205,11 +29,15 @@ def generate_kokoro_asmr_voiceover(text):
     try:
         kokoro = Kokoro("kokoro-v1.0.int8.onnx", "voices-v1.0.bin")
         try:
-            v1 = kokoro.get_voice_style("af_nicole")
-            v2 = kokoro.get_voice_style("af_heart")
-            target_voice = (v1 * 0.55) + (v2 * 0.45)
+            v_whisper = kokoro.get_voice_style("af_nicole")
+            v_emotion = kokoro.get_voice_style("af_heart")
+            # Breathy whisper body + slightly warmer emotional closing line
+            whisper_body_vec = (v_whisper * 0.78) + (v_emotion * 0.22)
+            whisper_final_vec = (v_whisper * 0.70) + (v_emotion * 0.30)
+            print("Using Emotional Whisper blend: 78% af_nicole + 22% af_heart (70/30 on closing line).")
         except Exception:
-            target_voice = "af_nicole"
+            whisper_body_vec = "af_nicole"
+            whisper_final_vec = "af_nicole"
 
         audio_segments = []
         sample_rate = 24000
@@ -217,28 +45,52 @@ def generate_kokoro_asmr_voiceover(text):
         total_phrases = len(phrases)
 
         for i, phrase in enumerate(phrases):
+            is_first = (i == 0)
             is_final = (i == total_phrases - 1 and total_phrases > 1)
-            phrase_speed = 0.80 if is_final else 0.84
 
+            # Natural human speed arc: soft intro -> gentle flow -> tender slow finish
+            if is_final:
+                phrase_speed = 0.74
+                active_voice = whisper_final_vec
+            elif is_first:
+                phrase_speed = 0.80
+                active_voice = whisper_body_vec
+            else:
+                phrase_speed = 0.82 if (i % 2 == 1) else 0.79
+                active_voice = whisper_body_vec
+
+            voiced_phrase = apply_emotional_phrasing(phrase, i, total_phrases)
             sent_start_sec = round(VO_START_DELAY + (cumulative_samples / float(sample_rate)), 2)
 
             samples, sample_rate = kokoro.create(
-                phrase,
-                voice=target_voice,
+                voiced_phrase,
+                voice=active_voice,
                 speed=phrase_speed,
                 lang="en-us"
             )
+
+            # Apply a 20ms soft fade-in/out on each phrase to prevent hard vocal cuts
+            samples = samples.astype(np.float32)
+            fade_len = min(int(sample_rate * 0.02), len(samples) // 4)
+            if fade_len > 1:
+                samples[:fade_len] *= np.linspace(0.0, 1.0, fade_len, dtype=np.float32)
+                samples[-fade_len:] *= np.linspace(1.0, 0.0, fade_len, dtype=np.float32)
+
             audio_segments.append(samples)
             cumulative_samples += len(samples)
             sent_end_sec = round(VO_START_DELAY + (cumulative_samples / float(sample_rate)), 2)
             line_windows.append((sent_start_sec, sent_end_sec))
-            print(f"Line {i+1} voice window: {sent_start_sec:.2f}s -> {sent_end_sec:.2f}s | '{phrase}'")
+            print(f"Line {i+1} whisper window: {sent_start_sec:.2f}s -> {sent_end_sec:.2f}s (speed={phrase_speed}x) | '{voiced_phrase}'")
 
             if i < total_phrases - 1:
-                pause_sec = 1.25 if (i + 1 == total_phrases - 1) else 0.85
+                # Longer breath pause before the final emotional line
+                pause_sec = 1.35 if (i + 1 == total_phrases - 1) else (0.95 if i % 2 == 1 else 0.70)
                 pause_samples = np.zeros(int(sample_rate * pause_sec), dtype=np.float32)
                 audio_segments.append(pause_samples)
                 cumulative_samples += len(pause_samples)
+
+        # Short trailing pad so intimate room reflections decay cleanly
+        audio_segments.append(np.zeros(int(sample_rate * 0.45), dtype=np.float32))
 
         full_audio = np.concatenate(audio_segments)
         sf.write("voice_raw.wav", full_audio, sample_rate)
@@ -251,7 +103,7 @@ def generate_kokoro_asmr_voiceover(text):
         try:
             import edge_tts
             import asyncio
-            communicate = edge_tts.Communicate(clean_spoken, voice="en-GB-RyanNeural", rate="-10%", pitch="-2Hz")
+            communicate = edge_tts.Communicate(clean_spoken, voice="en-US-AriaNeural", rate="-14%", pitch="-3Hz")
             asyncio.run(communicate.save("voice_raw.wav"))
             raw_gen = True
         except Exception as e2:
@@ -259,24 +111,35 @@ def generate_kokoro_asmr_voiceover(text):
 
     if raw_gen:
         try:
+            # Close-Mic Emotional Whisper Mastering Chain:
+            # - 180Hz proximity warmth + 480Hz boxy-resonance cut (removes normal "talking" tone)
+            # - 6.5kHz narrow de-esser + 10.5kHz breathy air boost (preserves delicate whisper texture)
+            # - Gentle compression brings up quiet emotional breath tails
+            # - 10ms binaural Haas delay + subtle room air + brickwall limiter (zero clipping)
             subprocess.run([
                 "ffmpeg", "-y", "-i", "voice_raw.wav",
                 "-af", (
                     "aformat=sample_rates=44100:channel_layouts=stereo,"
-                    "highpass=f=65,"
-                    "equalizer=f=130:width_type=o:w=1.5:g=3.0,"
-                    "equalizer=f=6200:width_type=o:w=1.5:g=-4.0,"
-                    "lowpass=f=8000,"
-                    "adelay=0|12,"
-                    "afade=t=in:st=0:d=0.12,"
-                    "volume=2.1"
+                    "highpass=f=80,"
+                    "equalizer=f=180:width_type=o:w=1.2:g=2.5,"
+                    "equalizer=f=480:width_type=o:w=1.0:g=-2.5,"
+                    "equalizer=f=6500:width_type=o:w=0.6:g=-3.5,"
+                    "equalizer=f=10500:width_type=o:w=1.2:g=3.0,"
+                    "lowpass=f=13500,"
+                    "acompressor=threshold=0.10:ratio=2.8:attack=15:release=180:makeup=1.5,"
+                    "aecho=0.90:0.90:55|110:0.08|0.04,"
+                    "adelay=0|10,"
+                    "volume=1.5,"
+                    "alimiter=limit=0.92,"
+                    "afade=t=in:st=0:d=0.15"
                 ),
                 "-ar", "44100", "-ac", "2", "voice.mp3"
             ], check=True)
-        except Exception:
+        except Exception as e_m:
+            print(f"Whisper mastering fallback ({e_m}): using clean stereo boost.")
             subprocess.run([
                 "ffmpeg", "-y", "-i", "voice_raw.wav",
-                "-af", "volume=2.0", "-ar", "44100", "-ac", "2", "voice.mp3"
+                "-af", "volume=1.8", "-ar", "44100", "-ac", "2", "voice.mp3"
             ], check=True)
     else:
         subprocess.run([
@@ -293,463 +156,3 @@ def generate_kokoro_asmr_voiceover(text):
             elapsed += dur_p
 
     return line_windows
-
-
-def prepare_single_line_overlays(body_text, line_windows):
-    """
-    Prepares each line so ONLY that line shows while its voiceover plays,
-    and the previous line disappears right before the next line begins.
-    """
-    cleaned = (body_text or "").replace("\r\n", "\n").replace("\u2028", "\n").replace("\u2029", "\n").strip()
-    if not cleaned:
-        cleaned = BEARDED_DRAGON_SCRIPTS[0]
-
-    raw_lines = [l.strip() for l in cleaned.split("\n") if l.strip()]
-    if len(raw_lines) == 1 and ". " in cleaned:
-        lines_source = [s.strip() for s in re.split(r'(?<=[.!?])\s+', cleaned) if s.strip()]
-    else:
-        lines_source = raw_lines
-
-    n = len(lines_source)
-    slots = []
-    for idx, src_line in enumerate(lines_source):
-        if line_windows and idx < len(line_windows):
-            s_t, e_t = line_windows[idx]
-        else:
-            s_t = round(VO_START_DELAY + (idx * 2.2), 2)
-            e_t = round(s_t + 1.8, 2)
-        slots.append({"text": src_line, "start_t": s_t, "end_t": e_t})
-
-    rendered_slots = []
-    file_idx = 0
-    for idx, sl in enumerate(slots):
-        start_t = sl["start_t"]
-        if idx < n - 1:
-            next_start = slots[idx + 1]["start_t"]
-            hide_t = round(max(start_t + 0.50, next_start - 0.12), 2)
-        else:
-            hide_t = None  # Last line stays until end fade-out
-
-        wrapped = textwrap.wrap(sl["text"], width=32) or [sl["text"]]
-        sub_count = len(wrapped)
-        sub_span = max(0.30, ((hide_t if hide_t is not None else (start_t + 2.2)) - start_t) / sub_count)
-
-        for w_idx, w_line in enumerate(wrapped):
-            w_start = round(start_t + (w_idx * sub_span), 2)
-            if w_idx < sub_count - 1:
-                w_hide = round(max(w_start + 0.25, start_t + ((w_idx + 1) * sub_span) - 0.05), 2)
-            else:
-                w_hide = hide_t
-
-            fname = f"overlay_line_{file_idx}.txt"
-            with open(fname, "w", encoding="utf-8", newline="\n") as f:
-                f.write(w_line)
-
-            rendered_slots.append({
-                "fname": fname,
-                "fontsize": 44,
-                "fontcolor": "#FFFFFF",
-                "start_t": w_start,
-                "hide_t": w_hide
-            })
-            file_idx += 1
-
-    return rendered_slots
-
-
-def strip_original_audio(input_path, output_path="raw_video.mp4"):
-    """Removes 100% of the original sound (-an) from the background video."""
-    try:
-        subprocess.run([
-            "ffmpeg", "-y", "-i", input_path,
-            "-c:v", "copy", "-an", output_path
-        ], check=True)
-    except Exception:
-        subprocess.run([
-            "ffmpeg", "-y", "-i", input_path,
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
-            "-pix_fmt", "yuv420p", "-an", output_path
-        ], check=True)
-    print(f"Stripped original sound (-an) from video: {os.path.basename(input_path)}")
-
-
-def download_from_google_drive(url, dest_path="drive_raw.mp4"):
-    """Downloads a shared Google Drive video file, handling large-file confirmation tokens."""
-    match = re.search(r'[?&]id=([a-zA-Z0-9_-]+)', url)
-    file_id = match.group(1) if match else ""
-    session = requests.Session()
-    resp = session.get(url, stream=True, timeout=60)
-
-    content_type = resp.headers.get("Content-Type", "").lower()
-    if "text/html" in content_type and file_id:
-        html_text = resp.text
-        resp.close()
-        confirm_match = re.search(r'confirm=([0-9A-Za-z_-]+)', html_text)
-        confirm_token = confirm_match.group(1) if confirm_match else "t"
-        confirm_url = f"https://drive.google.com/uc?export=download&confirm={confirm_token}&id={file_id}"
-        resp = session.get(confirm_url, stream=True, timeout=120)
-
-    if resp.status_code == 200:
-        with open(dest_path, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    f.write(chunk)
-        resp.close()
-        return os.path.exists(dest_path) and os.path.getsize(dest_path) > 50_000
-    resp.close()
-    return False
-
-
-def download_visual_background(target_duration):
-    """Downloads Google Drive background video first, strips original audio (-an), or uses local videos/."""
-    if drive_video_url and drive_video_url.startswith("http"):
-        try:
-            print(f"Downloading Google Drive video: {drive_video_url}")
-            if download_from_google_drive(drive_video_url, "drive_raw.mp4"):
-                strip_original_audio("drive_raw.mp4", "raw_video.mp4")
-                return
-        except Exception as e_drv:
-            print(f"Google Drive download failed ({e_drv}), checking local videos/...")
-
-    video_exts = (".mp4", ".mov", ".mkv", ".webm")
-    for folder in ["videos", "backgrounds", "clips"]:
-        if os.path.isdir(folder):
-            found = [
-                os.path.join(folder, f) for f in sorted(os.listdir(folder))
-                if f.lower().endswith(video_exts) and os.path.getsize(os.path.join(folder, f)) > 50_000
-            ]
-            if found:
-                idx = (max(1, int(row_id)) - 1) % len(found)
-                strip_original_audio(found[idx], "raw_video.mp4")
-                return
-
-    raise RuntimeError("No background video found! Provide drive_video_url from Google Drive or upload clips to videos/.")
-
-
-def fetch_relaxing_piano(target_duration):
-    """Loads custom piano.mp3 first, then Freesound soft relaxing piano, then gentle synth piano."""
-    for filename in ["piano.mp3", "bgm.mp3", "audio/piano.mp3", "audio/default.mp3"]:
-        if os.path.exists(filename) and os.path.getsize(filename) > 10_000:
-            print(f"Using relaxing piano track: {filename}")
-            return filename
-
-    excluded = {"voice.mp3", "voice_raw.mp3", "cloud_piano.mp3", "synth_piano.mp3", "asmr.mp3"}
-    custom_candidates = []
-    for pattern in ["*.mp3", "music/*.mp3", "audio/*.mp3"]:
-        for f in glob.glob(pattern):
-            if os.path.basename(f) not in excluded and os.path.getsize(f) > 10_000:
-                custom_candidates.append(f)
-    if custom_candidates:
-        return random.choice(custom_candidates)
-
-    if FREESOUND_API_KEY:
-        try:
-            query = urllib.parse.quote("soft relaxing piano calm ambient instrumental")
-            url = (
-                f"https://freesound.org/apiv2/search/text/"
-                f"?query={query}&filter=duration:[20 TO 300]&fields=id,name,previews"
-                f"&page_size=10&token={FREESOUND_API_KEY}"
-            )
-            r = requests.get(url, timeout=15)
-            if r.status_code == 200:
-                results = r.json().get("results", [])
-                if results:
-                    chosen = random.choice(results)
-                    mp3_url = chosen.get("previews", {}).get("preview-hq-mp3")
-                    if mp3_url:
-                        audio_data = requests.get(mp3_url, timeout=20).content
-                        if len(audio_data) > 5000:
-                            with open("cloud_piano.mp3", "wb") as f:
-                                f.write(audio_data)
-                            return "cloud_piano.mp3"
-        except Exception as e:
-            print(f"Freesound piano fallback triggered: {e}")
-
-    subprocess.run([
-        "ffmpeg", "-y",
-        "-f", "lavfi", "-i", f"sine=frequency=261.63:duration={target_duration:.2f}",
-        "-f", "lavfi", "-i", f"sine=frequency=329.63:duration={target_duration:.2f}",
-        "-f", "lavfi", "-i", f"sine=frequency=392.00:duration={target_duration:.2f}",
-        "-f", "lavfi", "-i", f"sine=frequency=493.88:duration={target_duration:.2f}",
-        "-filter_complex", (
-            "[0:a]tremolo=f=0.25:d=0.6[a0];"
-            "[1:a]tremolo=f=0.33:d=0.6[a1];"
-            "[2:a]tremolo=f=0.20:d=0.6[a2];"
-            "[3:a]tremolo=f=0.15:d=0.7[a3];"
-            "[a0][a1][a2][a3]amix=inputs=4:duration=first,"
-            "lowpass=f=650,aecho=0.8:0.88:120|240:0.4|0.3,volume=0.22"
-        ),
-        "synth_piano.mp3"
-    ], check=True)
-    return "synth_piano.mp3"
-
-
-def build_background_video_graph(raw_vid_dur, vo_end_time, total_dur):
-    """
-    - Video shorter than voiceover (raw_vid_dur < vo_end_time) -> plays forward, then 2nd time in reverse.
-    - Video longer than voiceover (raw_vid_dur >= vo_end_time) -> continues playing to end with relaxing piano.
-    - Zero dark overlay, vignette, grain, or color effects applied to background video.
-    """
-    base_prep = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=30"
-    if raw_vid_dur < vo_end_time and raw_vid_dur > 0.2:
-        pairs = max(1, math.ceil(total_dur / (2.0 * raw_vid_dur)))
-        total_splits = pairs * 2
-        split_labels = "".join(f"[s{i}]" for i in range(total_splits))
-        chain_parts = []
-        concat_inputs = ""
-        for p in range(pairs):
-            f_in = f"[s{2*p}]"
-            r_in = f"[s{2*p+1}]"
-            f_out = f"[fwd{p}]"
-            r_out = f"[rev{p}]"
-            chain_parts.append(f"{f_in}setpts=PTS-STARTPTS{f_out}")
-            chain_parts.append(f"{r_in}reverse,setpts=PTS-STARTPTS{r_out}")
-            concat_inputs += f"{f_out}{r_out}"
-        return f"[0:v]{base_prep},split={total_splits}{split_labels};" + ";".join(chain_parts) + f";{concat_inputs}concat=n={total_splits}:v=1:a=0[vbg];"
-    return f"[0:v]{base_prep},setpts=PTS-STARTPTS[vbg];"
-
-
-def render_ffmpeg(piano_file, vo_duration, total_duration, line_windows):
-    raw_vid_duration = get_duration("raw_video.mp4")
-    piano_dur = get_duration(piano_file)
-    max_offset = max(0.0, piano_dur - total_duration - 2.0)
-    piano_start = random.uniform(0.0, max_offset) if max_offset > 4.0 else 0.0
-
-    rendered_slots = prepare_single_line_overlays(overlay_text, line_windows)
-    quote_font = get_quote_font_path()
-
-    # Single-line center-bottom Y coordinate on 1080x1920 frame
-    y_pos = 1920 - 260
-
-    audio_fade_start = max(total_duration - AUDIO_FADE_DURATION, total_duration - 2.0)
-    final_text_fade_start = max(total_duration - 0.50, VO_START_DELAY + 1.0)
-    final_text_fade_end = round(final_text_fade_start + 0.35, 2)
-
-    drawtext_filters = []
-    for sl in rendered_slots:
-        start_t = sl["start_t"]
-        hide_t = sl["hide_t"]
-        fade_in_dur = 0.25
-        fade_in_end = round(start_t + fade_in_dur, 2)
-
-        if hide_t is not None:
-            fade_out_dur = 0.15
-            fade_out_start = round(max(fade_in_end + 0.05, hide_t - fade_out_dur), 2)
-            line_alpha = (
-                f"if(lt(t,{start_t:.2f}),0,"
-                f"if(lt(t,{fade_in_end:.2f}),(t-{start_t:.2f})/{fade_in_dur:.2f},"
-                f"if(lt(t,{fade_out_start:.2f}),1,"
-                f"if(lt(t,{hide_t:.2f}),({hide_t:.2f}-t)/{fade_out_dur:.2f},0))))"
-            )
-            enable_expr = f"between(t,{start_t:.2f},{hide_t:.2f})"
-        else:
-            line_alpha = (
-                f"if(lt(t,{start_t:.2f}),0,"
-                f"if(lt(t,{fade_in_end:.2f}),(t-{start_t:.2f})/{fade_in_dur:.2f},"
-                f"if(lt(t,{final_text_fade_start:.2f}),1,"
-                f"if(lt(t,{final_text_fade_end:.2f}),({final_text_fade_end:.2f}-t)/0.35,0))))"
-            )
-            enable_expr = f"gte(t,{start_t:.2f})"
-
-        drawtext_filters.append(
-            f"drawtext=fontfile={quote_font}:"
-            f"textfile={sl['fname']}:"
-            f"fontcolor={sl['fontcolor']}:"
-            f"fontsize={sl['fontsize']}:"
-            f"x=(w-text_w)/2:"
-            f"y={y_pos}:"
-            f"shadowcolor=black@0.90:shadowx=3:shadowy=4:"
-            f"enable='{enable_expr}':"
-            f"alpha='{line_alpha}'"
-        )
-
-    drawtext_filters_str = ",".join(drawtext_filters)
-    vo_start = VO_START_DELAY
-    vo_end = round(VO_START_DELAY + vo_duration, 2)
-    adelay_ms = int(VO_START_DELAY * 1000)
-
-    bg_graph = build_background_video_graph(raw_vid_duration, vo_end, total_duration)
-    v_filter = f"{bg_graph}[vbg]{drawtext_filters_str}[v]"
-
-    piano_vol_expr = f"if(between(t,{vo_start:.2f},{vo_end:.2f}),0.20,0.38)"
-
-    a_filter = (
-        f"[1:a]aformat=sample_rates=44100:channel_layouts=stereo,"
-        f"lowpass=f=3200,volume='{piano_vol_expr}':eval=frame[piano];"
-        f"[2:a]aformat=sample_rates=44100:channel_layouts=stereo,"
-        f"adelay={adelay_ms}|{adelay_ms},apad=whole_dur={total_duration:.2f}[voice];"
-        f"[piano][voice]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,"
-        f"afade=t=in:st=0:d=0.4,"
-        f"afade=t=out:st={audio_fade_start:.2f}:d={AUDIO_FADE_DURATION}[a]"
-    )
-
-    filter_complex = f"{v_filter};{a_filter}"
-    subprocess.run([
-        "ffmpeg", "-y",
-        "-i", "raw_video.mp4",
-        "-ss", f"{piano_start:.2f}", "-stream_loop", "-1", "-i", piano_file,
-        "-i", "voice.mp3",
-        "-filter_complex", filter_complex,
-        "-map", "[v]", "-map", "[a]",
-        "-t", f"{total_duration:.2f}",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "192k",
-        "-movflags", "+faststart",
-        "final_output.mp4"
-    ], check=True)
-
-
-def verify_url_accessible(url):
-    if not url or not url.startswith("https://"):
-        return False
-    try:
-        r = requests.get(url, stream=True, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
-        ok = r.status_code in (200, 206)
-        r.close()
-        return ok
-    except Exception as e:
-        print(f"URL verification failed for {url}: {e}")
-        return False
-
-
-def upload_to_github_release(filepath):
-    gh_token = os.environ.get("GITHUB_TOKEN", "").strip()
-    gh_repo = os.environ.get("GITHUB_REPOSITORY", "maaaaaaaahiuddin-code/cloud-video-engine").strip()
-    if not gh_token:
-        return ""
-
-    headers = {
-        "Authorization": f"Bearer {gh_token}",
-        "Accept": "application/vnd.github+json"
-    }
-    tag_name = "rendered-videos"
-    api_base = f"https://api.github.com/repos/{gh_repo}"
-
-    r = requests.get(f"{api_base}/releases/tags/{tag_name}", headers=headers, timeout=20)
-    if r.status_code == 200:
-        release_data = r.json()
-    else:
-        r_create = requests.post(
-            f"{api_base}/releases",
-            headers=headers,
-            json={
-                "tag_name": tag_name,
-                "name": "Automated Cloud Videos",
-                "body": "Hosted MP4 assets for Make.com social publishing.",
-                "draft": False,
-                "prerelease": False
-            },
-            timeout=20
-        )
-        if r_create.status_code not in (200, 201):
-            return ""
-        release_data = r_create.json()
-
-    release_id = release_data.get("id")
-    asset_name = f"beardie_row_{row_id}_{random.randint(1000, 9999)}.mp4"
-    upload_url = f"https://uploads.github.com/repos/{gh_repo}/releases/{release_id}/assets?name={asset_name}"
-    upload_headers = {
-        "Authorization": f"Bearer {gh_token}",
-        "Content-Type": "video/mp4",
-        "Accept": "application/vnd.github+json"
-    }
-    with open(filepath, "rb") as f:
-        r_up = requests.post(upload_url, headers=upload_headers, data=f, timeout=120)
-
-    if r_up.status_code in (200, 201):
-        dl_url = r_up.json().get("browser_download_url", "")
-        if verify_url_accessible(dl_url):
-            return dl_url
-    return ""
-
-
-def upload_video_with_fallback():
-    if os.environ.get("CLOUDINARY_URL", "").startswith("cloudinary://"):
-        try:
-            res = cloudinary.uploader.upload(
-                "final_output.mp4",
-                resource_type="video",
-                folder="auto_relaxing_videos",
-                timeout=120
-            )
-            video_url = res.get("secure_url", "")
-            if verify_url_accessible(video_url):
-                return video_url
-        except Exception as e:
-            print(f"Cloudinary upload skipped ({e}).")
-
-    gh_url = upload_to_github_release("final_output.mp4")
-    if gh_url:
-        return gh_url
-
-    try:
-        with open("final_output.mp4", "rb") as f:
-            r = requests.post(
-                "https://tmpfiles.org/api/v1/upload",
-                files={"file": ("final_output.mp4", f, "video/mp4")},
-                timeout=60
-            )
-        if r.status_code == 200:
-            raw_url = r.json().get("data", {}).get("url", "")
-            if raw_url:
-                direct_url = raw_url.replace("http://", "https://", 1).replace("tmpfiles.org/", "tmpfiles.org/dl/", 1)
-                if verify_url_accessible(direct_url):
-                    return direct_url
-    except Exception as e_tmp:
-        print(f"tmpfiles backup failed: {e_tmp}")
-
-    return ""
-
-
-def main():
-    ensure_assets()
-
-    # Step 1: Generate English voiceover line-by-line and capture each line's start/end window
-    line_windows = generate_kokoro_asmr_voiceover(overlay_text)
-    vo_duration = get_duration("voice.mp3")
-    vo_end = round(VO_START_DELAY + vo_duration, 2)
-
-    # Step 2: Fetch background video (original sound removed) and set duration behavior
-    download_visual_background(max(MIN_VIDEO_DURATION, vo_end + EXTRA_TAIL_SECONDS))
-    raw_vid_duration = get_duration("raw_video.mp4")
-
-    if raw_vid_duration > vo_end:
-        total_duration = max(MIN_VIDEO_DURATION, round(raw_vid_duration, 2))
-        print(f"Video ({raw_vid_duration:.2f}s) > Voiceover end ({vo_end:.2f}s): continuing video to {total_duration:.2f}s with relaxing piano.")
-    else:
-        total_duration = max(MIN_VIDEO_DURATION, round(vo_end + EXTRA_TAIL_SECONDS, 2))
-        print(f"Video ({raw_vid_duration:.2f}s) < Voiceover end ({vo_end:.2f}s): playing 2nd time in reverse up to {total_duration:.2f}s.")
-
-    piano_file = fetch_relaxing_piano(total_duration)
-
-    # Step 3: Render final video showing only one overlay line at a time synced with voiceover
-    render_ffmpeg(piano_file, vo_duration, total_duration, line_windows)
-    video_url = upload_video_with_fallback()
-    print(f"Final Hosted Video URL: {video_url}")
-
-    if not video_url or not video_url.startswith("http"):
-        raise RuntimeError("Video upload failed across all hosts; no valid video_url to send to Make.com!")
-
-    webhook_payload = {
-        "row_id": row_id,
-        "title": f"Bearded Dragon #{row_id}",
-        "video_url": video_url,
-        "caption": caption
-    }
-
-    target_webhooks = [PRIMARY_MAKE_WEBHOOK]
-    if MAKE_WEBHOOK_URL.startswith("http") and MAKE_WEBHOOK_URL != PRIMARY_MAKE_WEBHOOK:
-        target_webhooks.append(MAKE_WEBHOOK_URL)
-
-    for wh_url in target_webhooks:
-        resp = requests.post(
-            wh_url,
-            json=webhook_payload,
-            headers={"Content-Type": "application/json"},
-            timeout=30
-        )
-        print(f"Sent webhook to {wh_url} -> Status: {resp.status_code} | Response: {resp.text}")
-
-
-if __name__ == "__main__":
-    main()
